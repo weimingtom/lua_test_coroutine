@@ -71,7 +71,8 @@ void test_stack_print() {
 void test_coroutine() {
     lua_State *L = luaL_newstate();
 
-    luaopen_base(L);
+    //luaopen_base(L);
+	luaL_openlibs(L);
 
     if (luaL_dofile(L, "coroutine.lua")) {
         printf(">>error: %s\n", lua_tostring(L, lua_gettop(L)));
@@ -83,11 +84,28 @@ void test_coroutine() {
     lua_State *co = lua_newthread(L);
 
     lua_getglobal(co, "step");
-
-    while(lua_resume(co, 0)) {
+	//printStack(co);
+	if (!lua_isfunction(co, -1)) {
+        printf(">>error : \'step\' is not function\n");
+		fflush(stdout);
+        lua_close(L);
+        return;
+	}
+    while (lua_resume(co, 0)) {
         printStack(co);
-        _getch();
-    }
+        //_getch();
+		//getch();
+		if (_kbhit())
+		{
+			int c = getch();
+			if (c == 'q')
+			{
+				printf("exit!!!");
+				break;
+			}
+		}
+		//fflush(stdin);
+	}
 
     lua_close(L);
 }
@@ -95,8 +113,8 @@ void test_coroutine() {
 //see http://marupeke296.com/LUA_No3_Coroutine.html
 int main(int argc, char* argv[])
 {
-	printf("Hello World!\n");
-	test_stack_print();
+	//printf("Hello World!\n");
+	//test_stack_print();
 	test_coroutine();
 	return 0;
 }
