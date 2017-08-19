@@ -50,7 +50,7 @@ function trace(event, line)
 	if true then
 		print("deltaTime = ", deltaTime)
 		
-		--coroutine.yield("check exit");
+		return coroutine.yield("check exit");
 		--startTime = os.clock()
 	end
 end
