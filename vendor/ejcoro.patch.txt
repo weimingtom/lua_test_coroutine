@@ -1,0 +1,2910 @@
+diff -crN lua-5.0.2/README.coroutines lua-5.0.2.experimental/README.coroutines
+*** lua-5.0.2/README.coroutines	Wed Dec 31 18:00:00 1969
+--- lua-5.0.2.experimental/README.coroutines	Sun Dec  5 01:13:46 2004
+***************
+*** 0 ****
+--- 1,352 ----
++ 
++ This is a patch to improve support of coroutines in Lua 5.0.2.
++ Its main purpose is to remove the restrictions on yielding coroutines
++ from within metamethods or C functions to largest degree possible
++ without introducing operating system-dependence or reliance on
++ OS facilities such as threading libraries or C stack allocations.
++ 
++ It is backwards compatible except to programs that look for the
++ specific error message "attempt to yield across metamethod/C-call boundary",
++ which has been changed to be more accurate and state which Lua API call
++ was used that was incompatible with yielding.
++ 
++ Theory of operation:
++ 
++ This patch uses a slightly different strategy to allow yielding than
++ Lua does in the standard case (Lua functions calling Lua functions).
++ In the standard case, Lua maintains a single set of C stack frames
++ for as many Lua frame (CallInfo's) that are invoked using normal
++ function calls. The bottommost of these C stack frames is the main
++ loop of the interpreter, luaV_execute(). Calls from Lua to Lua are
++ accomplished without reentering luaV_execute; instead, the new
++ Lua frame is added or removed from the stack and a "goto" is executed
++ to restart the luaV_execute() C frame at an appropriate point.
++ 
++                                   /<+------------+
++                                  /  |  luaFunc3  |
++                                 /   |            |
++                                /    +------------+
++                               /     |  luaFunc2  |
++                              /      | CI_CALLING |
++                             /       +------------+
++             +--------------+  1:n   |  luaFunc1  |
++             | luaV_execute |        | CI_CALLING |
++             +--------------+<======>+------------+
++                 C stack              Lua CallInfo's
++                 
++ This figure illustrates how the C stack and the Lua CallInfo frame
++ stack line up for the case of Lua functions calling Lua functions.
++ A single C frame of luaV_execute() maps to any number of Lua frames.
++ Note that the CI_CALLING flag is set in the functions which have made
++ calls this way.
++ 
++ When a metamethod or C function calls back into standard Lua, the
++ luaV_execute() function is reentered, and yields are prohibited.
++                                                   
++                                     +------------+
++                                     |  luaFunc2  |
++             +--------------+        |            |
++             | luaV_execute |<======>|            |
++   ..........+--------------+........+------------+  
++             |   callTMxxx  |        |  luaFunc1  |
++             +--------------+        |            |
++             | luaV_execute |<======>|            |
++             +--------------+        +------------+
++                 C stack              Lua CallInfo's
++ 
++                                     +------------+
++                                     |  luaFunc2  |
++             +--------------+        |            |
++             | luaV_execute |<======>|            |
++   ..........+--------------+........+------------+  
++             |    cFunc     |        |   cFunc   C|
++             +--------------+        +------------+
++             | luaV_execute |<======>|  luaFunc1  |
++             +--------------+        +------------+
++                 C stack              Lua CallInfo's
++ 
++ This figure shows how the C stack and Lua CallInfo's line up for
++ the case of a metamethod or C function that calls Lua code. The
++ CI_CALLING flag is not set in this case. The dotted line represents
++ how the C stack is divided into two sets of C frames, one for each
++ of the Lua CallInfo's. This line is exactly the boundary that standard
++ Lua won't let you yield across.                
++ 
++ One strategy for removing this limitation for metamethods would be to
++ make metamethod calls behave similarly to normal function calls for
++ Lua; i.e., they would not reenter luaV_execute() but simply "goto"
++ to the start of the luaV_execute() C frame that is already running.
++ While possibly feasible for pure Lua metamethods, this approach is
++ not satisfactory for use with C functions for the following two reasons:
++ 
++   - Local variables
++   
++     C functions often store local variables on the C stack. In order to
++     maintain a single instance of luaV_execute(), those variables would
++     have to be moved off the C stack to somewhere else (e.g., the Lua
++     stack) in order to let the C stack unwind. This is not an issue for
++     Lua functions because Lua functions store their local variables on the
++     Lua stack anyway. However, for C functions, it would be mandatory to
++     unwind the stack in order to call back into Lua. This is an undesirable
++     requirement for C functions. Although it is necessary that the C
++     function be able to do in order to take full advantage of coroutines,
++     it is not necessary that they actually do it every time they want to
++     call back into Lua. If the called code never yields, it's simply a
++     waste of CPU time to transfer the variables back and forth.
++     
++ 
++ This patch solves these problems by using an optimistic strategy. When
++ a call is made from a C function into Lua code, it is first assumed that
++ the Lua code will not yield, and the C stack is built up recursively
++ just as in standard Lua. If the called function completes without yielding,
++ the situation is exactly as it is in standard Lua. But suppose that the Lua
++ code instead yields:
++ 
++                 +-----------------+        +------------+
++             /---| coroutine.yield |        |  luaFunc2  |
++             |   +-----------------+        |            |
++        -1   |   |  luaV_execute   |<======>|            |  <-
++       Yield |   +-----------------+        +------------+    \
++       return|   |     cFunc       |        |   cFunc   C|  <-- CI_CALLING flag becomes set
++       value |   +-----------------+        +------------+    /
++             |   |  luaV_execute   |<======>|  luaFunc1  |  <-
++             v   +-----------------+        +------------+
++                      C stack                Lua CallInfo's
++                 
++ The yield function generates a return value of -1. At this point, the
++ interpreter knows that the optimistic strategy won't work, and begins to
++ unwind the C stack. As the yield return value is propagated downwards,
++ each C frame is required to either save its state in the corresponding
++ Lua frame(s), set the CI_CALLING flag, and return -1, or else throw
++ an error saying that the yield can't be completed. It is at this point
++ that the error regarding an illegal yield will occur.
++ 
++ If the yield is successful, then the C stack is back to its unwound state,
++ and the Lua stack contains all of the state information. By waiting until
++ the -1 yield return value appears before asking C functions to save state,
++ we optimize for the case that a yield does not occur, while giving C functions
++ to opportunity to handle it if it does occur.
++ 
++ When the coroutine is resumed, the top CallInfo is examined just as in
++ current Lua. Because the stack has successfully unwound, the CI_CALLING
++ flag is set. This indicates that the code to complete the function call
++ (the call to luaD_poscall) isn't waiting on the C continuation, and we
++ need to figure out how to complete the function call and resume the
++ function based on CallInfo state. For Lua functions, this involves looking at
++ the opcode of the instruction at (ci->savedpc - 1). There is a switch
++ in a new function called luaV_return() that does this. For a C function,
++ it involves calling the C function again to ask it to resume itself.
++ There is a new user-defined integer/pointer union field in the CallInfo
++ structure that can be used by C functions in order to do this. This is
++ also handled by luaV_return().
++ 
++ Here's a summary of what the patch changes:
++ 
++ - It is no longer automatically an error to call coroutine.yield()
++   from within a metamethod or C function. Instead, the yield proceeds
++   to try to unwind the C stack, and an error only occurs if at some
++   point, a C function is unable to handle the yield request.
++   
++   The error message indicates which API call was used that could not
++   handle a yield.
++   
++ - All metamethods except __gc can be yielded from without error.
++ 
++ - An iterator function can yield without error.
++ 
++ - C functions which callback into Lua code will throw the error if
++   the Lua code yields unless those functions are adapted to use the
++   new "yp" (yield possible) API.
++   
++   New API functions:
++   
++   int lua_call_yp (lua_State *L, int nargs, int nresults, int tailcall);
++   
++       This function has the same meaning as lua_call(), except that it
++       will not prevent the called code from yielding. If a yield occurs,
++       the return value is -1. Otherwise, the return value is the actual
++       number of results.
++       
++       The tailcall parameter should be set to 1 if this call is the
++       last operation that the C function is to do. In this case, if the
++       code yields, when it resumes, the results returned by the called
++       function will become the results of the C function. In this case,
++       the API can be called simply like this:
++       
++           return lua_call_yp(..., 1);
++       
++       If the tailcall parameter is set to 0, and the code yields, when
++       it resumes, the C function will be reinvoked. The lua_call_yp()
++       returns -1 in this case, and the C function will need to save
++       the state of its local variables and other state to be able to
++       reconstruct them when the C function is reinvoked. It may use
++       the Lua stack for this purpose; however, it _may not push_ values
++       onto the Lua stack, as the called function(s) have taken the space
++       directly above the stack.
++       
++       Probably the easiest way to do this for a lot of C functions is
++       to reserve a couple of slots in the stack which can be filled in
++       with numbers or perhaps userdata (with __gc metamethod set if
++       necessary for cleanup.)
++       
++       When the C function is reinvoked, the Lua stack is how it would
++       be had the original lua_call_yp() succeeded, and it is legal to
++       push values on the stack again.
++       
++       
++   void *lua_get_frame_state (lua_State *L);
++   
++       This function returns a pointer to a variable in the Lua stack
++       frame which may be used by C functions to retain state across
++       reinvocations of the C function. The return value may be cast to
++       an int * or void **. When the C function is first invoked, the
++       value of the frame state is always 0. Prior to returning -1 in case
++       of an API call that yielded, the C function should set the frame
++       state to a non-zero value, so that it will recognize that it is
++       being resumed the next time it is called.
++       
++       Possible uses for the frame state value are: numeric counter for
++       simple loops, stack index of stored variables, or pointer to
++       userdata (the userdata must of course be stored in the stack somewhere
++       to prevent it from being collected.)
++       
++       
++ - The following functions in the standard library have been converted to
++   use the YP API:
++   
++   table.foreachi()
++   table.foreach()
++   tostring()
++   print()
++   dofile()
++   string.gsub()
++ 
++   Consequently, the callback functions invoked from these functions are
++   able to yield.
++   
++ 
++ Internal changes:
++ 
++ - The code to finsh the execution of OP_CALL/OP_TAILCALL that
++   appeared in resume() and luaV_execute() has been consolidated
++   into a new function called luaV_return() which generalizes this
++   operation for all opcodes which may be yielded out of, and for
++   C functions which use the YP API calls to allow yields.
++   
++   These opcodes are:
++   
++       OP_CALL
++       OP_TAILCALL
++       OP_GETTABLE
++       OP_GETGLOBAL
++       OP_SELF
++       OP_ADD
++       OP_SUB
++       OP_MUL
++       OP_DIV
++       OP_POW
++       OP_CONCAT
++       OP_UNM
++       OP_LT
++       OP_LE
++       OP_EQ
++       OP_SETTABLE
++       OP_SETGLOBAL
++       OP_TFORLOOP
++       
++   luaV_return() is called from luaV_execute() during the
++   execution of OP_RETURN, and from resume() when a coroutine
++   is resumed.
++ 
++ - luaD_precall() is no longer guaranteed to set up exactly one
++   new CallInfo frame on the Lua stack. Instead, it may end up
++   creating any number of frames. This is because luaD_precall()
++   will try to invoke a C function immediately, which may call-
++   back into Lua code and continue to set up CallInfo frames
++   until it encounters a yield.
++   
++ - The meaning of the CI_CALLING CallInfo flag has been slightly
++   altered/clarified: (The name is not that descriptive anymore;
++   not sure if it ever was...)
++   
++      0 = There exists an active C stack frame for this CallInfo,
++          which is waiting for the return value of the next higher
++          CallInfo to be returned to it via C-return, and which
++          will execute luaD_poscall() with that return value to
++          deactivate that next higher CallInfo.
++          
++          References: luaD_call, luaD_call_yp, resume, luaV_execute
++          
++      1 = There does not exist an active C stack frame for this
++          CallInfo. When the next higher CallInfo returns, the
++          luaV_return() function must be called with a pointer
++          to this CallInfo in order to resume it. luaV_return()
++          handles the luaD_poscall() to deactivate that next
++          higher CallInfo.
++          
++   Using this description, it is easy to see where CI_CALLING
++   must be set. It should be set by a function that calls
++   luaD_precall() and would be about to call luaD_poscall(),
++   but it will not get a chance to because the called function
++   yielded (either luaD_precall() > L->top or luaV_execute()
++   returned NULL) and the function must return.
++   
++   The CI_CALLING flag is set -
++   
++      in lvm.c, during execution of OP_CALL and OP_TAILCALL, when
++         they call a C function that yields;
++         
++      in lvm.c, during execution of OP_CALL into a Lua function;
++   
++      in lvm.c, during execution of opcodes which call a metamethod
++         to get a value, and the metamethod yields.
++         (via the SETOBJ2S_YP macro, which also saves the PC.)
++         
++      in lvm.c, during execution of opcodes which call a metamethod
++         but don't need a value, and the metamethod yields.
++         (via the YP macro which also saves the PC.)
++         
++      in lvm.c, during execution of OP_UNM, OP_EQ, OP_LE, OP_LT
++         opcodes which operate similarly but don't use macros.
++         
++      in lapi.c, when the C function calls lua_call_yp(), and the
++         called function yields. In this case, there is no PC
++         to save; the C function is responsible for saving its
++         own state. However, the stack pointer and the number
++         of results requested from the lua_call_yp() are saved
++         into the CallInfo so that the call can be completed
++         in the future.
++ 
++ - Note that due to the change in luaD_precall (that it may go
++   ahead and add as many CallInfo's as it can onto the stack
++   until it encounters a yield), the CI_CALLING flags should not
++   be set using (L->ci-1) as was done previously. The CallInfo
++   pointer must be saved _prior_ to calling luaD_precall.
++ 
++ - The nCcalls counter is no longer used to prohibit yields from
++   occuring. Instead, the error from an invalid yield is generated
++   by the API call that could not handle the yield. The nCcalls
++   counter is still maintained; however, its value may not be
++   that useful as it counts C functions that have been suspended
++   (removed from the C stack); therefore it may not have any
++   relevance to the size of the C stack.
++ 
++   
++ TODO:
++ 
++ - Complete set of YP API functions:
++ 
++   lua_gettable_yp()
++   lua_settable_yp()
++   ...
++   etc
++ 
++ - Find some way to give C functions the ability to allocate stack
++   space when they need to suspend?? That might be very difficult,
++   as the next higher function has already come in on top of us.
++   For now, C functions have to preallocate any stack space they
++   might need.
++ 
++ Tests:
++ 
++   Currently in testmeta.lua. More needed.
+diff -crN lua-5.0.2/include/lauxlib.h lua-5.0.2.experimental/include/lauxlib.h
+*** lua-5.0.2/include/lauxlib.h	Thu Apr  3 07:35:34 2003
+--- lua-5.0.2.experimental/include/lauxlib.h	Sun Dec  5 01:13:46 2004
+***************
+*** 106,111 ****
+--- 106,112 ----
+  #define luaL_addsize(B,n)	((B)->p += (n))
+  
+  LUALIB_API void luaL_buffinit (lua_State *L, luaL_Buffer *B);
++ LUALIB_API void luaL_buffcopy (luaL_Buffer *src, luaL_Buffer *dst);
+  LUALIB_API char *luaL_prepbuffer (luaL_Buffer *B);
+  LUALIB_API void luaL_addlstring (luaL_Buffer *B, const char *s, size_t l);
+  LUALIB_API void luaL_addstring (luaL_Buffer *B, const char *s);
+diff -crN lua-5.0.2/include/lua.h lua-5.0.2.experimental/include/lua.h
+*** lua-5.0.2/include/lua.h	Thu Mar 11 19:44:52 2004
+--- lua-5.0.2.experimental/include/lua.h	Sun Dec  5 01:13:46 2004
+***************
+*** 14,20 ****
+  #include <stddef.h>
+  
+  
+! #define LUA_VERSION	"Lua 5.0.2"
+  #define LUA_COPYRIGHT	"Copyright (C) 1994-2004 Tecgraf, PUC-Rio"
+  #define LUA_AUTHORS 	"R. Ierusalimschy, L. H. de Figueiredo & W. Celes"
+  
+--- 14,20 ----
+  #include <stddef.h>
+  
+  
+! #define LUA_VERSION	"Lua 5.0.2 +EJcoroPatch"
+  #define LUA_COPYRIGHT	"Copyright (C) 1994-2004 Tecgraf, PUC-Rio"
+  #define LUA_AUTHORS 	"R. Ierusalimschy, L. H. de Figueiredo & W. Celes"
+  
+***************
+*** 186,196 ****
+--- 186,199 ----
+  ** `load' and `call' functions (load and run Lua code)
+  */
+  LUA_API void  lua_call (lua_State *L, int nargs, int nresults);
++ LUA_API int   lua_call_yp (lua_State *L, int nargs, int nresults, int tailcall);
+  LUA_API int   lua_pcall (lua_State *L, int nargs, int nresults, int errfunc);
+  LUA_API int lua_cpcall (lua_State *L, lua_CFunction func, void *ud);
+  LUA_API int   lua_load (lua_State *L, lua_Chunkreader reader, void *dt,
+                          const char *chunkname);
+  
++ LUA_API void *lua_get_frame_state (lua_State *L);
++ 
+  LUA_API int lua_dump (lua_State *L, lua_Chunkwriter writer, void *data);
+  
+  
+diff -crN lua-5.0.2/src/lapi.c lua-5.0.2.experimental/src/lapi.c
+*** lua-5.0.2/src/lapi.c	Mon Apr  7 09:36:08 2003
+--- lua-5.0.2.experimental/src/lapi.c	Sun Dec  5 01:13:46 2004
+***************
+*** 272,277 ****
+--- 272,281 ----
+    o2 = luaA_indexAcceptable(L, index2);
+    i = (o1 == NULL || o2 == NULL) ? 0  /* index out of range */
+                                   : equalobj(L, o1, o2);
++   if (i < 0) {
++     lua_pushstring(L, "attempt to yield across C function which does not support it through lua_equal");
++     lua_error(L);
++   }	
+    lua_unlock(L);
+    return i;
+  }
+***************
+*** 285,290 ****
+--- 289,298 ----
+    o2 = luaA_indexAcceptable(L, index2);
+    i = (o1 == NULL || o2 == NULL) ? 0  /* index out-of-range */
+                                   : luaV_lessthan(L, o1, o2);
++   if (i < 0) {
++     lua_pushstring(L, "attempt to yield across C function which does not support it through lua_lessthan");
++     lua_error(L);
++   }	
+    lua_unlock(L);
+    return i;
+  }
+***************
+*** 482,491 ****
+  
+  
+  LUA_API void lua_gettable (lua_State *L, int idx) {
+    StkId t;
+    lua_lock(L);
+    t = luaA_index(L, idx);
+!   setobj2s(L->top - 1, luaV_gettable(L, t, L->top - 1, 0));
+    lua_unlock(L);
+  }
+  
+--- 490,505 ----
+  
+  
+  LUA_API void lua_gettable (lua_State *L, int idx) {
++   const TObject *res;
+    StkId t;
+    lua_lock(L);
+    t = luaA_index(L, idx);
+!   res = luaV_gettable(L, t, L->top - 1, 0);
+!   if (!res) {
+!     lua_pushstring(L, "attempt to yield across C function which does not support it through lua_gettable");
+!     lua_error(L);
+!   }	
+!   setobj2s(L->top - 1, res);
+    lua_unlock(L);
+  }
+  
+***************
+*** 568,579 ****
+    lua_lock(L);
+    api_checknelems(L, 2);
+    t = luaA_index(L, idx);
+!   luaV_settable(L, t, L->top - 2, L->top - 1);
+    L->top -= 2;  /* pop index and value */
+    lua_unlock(L);
+  }
+  
+  
+  LUA_API void lua_rawset (lua_State *L, int idx) {
+    StkId t;
+    lua_lock(L);
+--- 582,625 ----
+    lua_lock(L);
+    api_checknelems(L, 2);
+    t = luaA_index(L, idx);
+!   if (luaV_settable(L, t, L->top - 2, L->top - 1)) {
+!     lua_pushstring(L, "attempt to yield across C function which does not support it through lua_settable");
+!     lua_error(L);
+!   }	
+    L->top -= 2;  /* pop index and value */
+    lua_unlock(L);
+  }
+  
+  
++ LUA_API int lua_settable_yp (lua_State *L, int idx) {
++   ptrdiff_t orig_top = savestack(L, L->top);
++   int ci_off = L->ci - L->base_ci;
++   StkId t;
++   lua_lock(L);
++   api_checknelems(L, 2);
++   t = luaA_index(L, idx);
++   if (luaV_settable(L, t, L->top - 2, L->top - 1)) {
++     CallInfo *ci = L->base_ci + ci_off;
++     
++     /* The function yielded. Set the calling flag, and memorize the number
++      * of results to complete the call later. */
++      
++     ci->state |= CI_CALLING;
++     ci->u.c.nresults = 0;
++     
++     /* Save the stack pointer, and give the C function the stack it expects. */
++     ci->u.c.savetop = L->top;
++     L->base = ci->base;
++     L->top = restorestack(L, orig_top);
++ 
++     lua_unlock(L);
++     return -1;
++   }	
++   lua_unlock(L);
++   return 0;
++ }
++ 
++ 
+  LUA_API void lua_rawset (lua_State *L, int idx) {
+    StkId t;
+    lua_lock(L);
+***************
+*** 656,661 ****
+--- 702,736 ----
+    lua_unlock(L);
+  }
+  
++ LUA_API int lua_call_yp (lua_State *L, int nargs, int nresults, int tailcall) {
++   ptrdiff_t orig_top = savestack(L, L->top);
++   int ret;
++   StkId func;
++   int ci_off = L->ci - L->base_ci;
++   lua_lock(L);
++   api_checknelems(L, nargs+1);
++   func = L->top - (nargs+1);
++   ret = luaD_call_yp(L, func, nresults);
++   if (ret < 0) {
++     CallInfo *ci = L->base_ci + ci_off;
++     
++     /* The function yielded. Set the calling flag, and memorize the number
++      * of results to complete the call later. */
++      
++     ci->state |= CI_CALLING;
++     if (tailcall)
++       ci->state |= CI_CTAILCALL;
++     ci->u.c.nresults = nresults;
++     
++     /* Save the stack pointer, and give the C function the stack it expects. */
++     ci->u.c.savetop = L->top;
++     L->base = ci->base;
++     L->top = restorestack(L, orig_top);
++   }
++   lua_unlock(L);
++   return ret;
++ }
++ 
+  
+  
+  /*
+***************
+*** 831,837 ****
+    luaC_checkGC(L);
+    api_checknelems(L, n);
+    if (n >= 2) {
+!     luaV_concat(L, n, L->top - L->base - 1);
+      L->top -= (n-1);
+    }
+    else if (n == 0) {  /* push empty string */
+--- 906,915 ----
+    luaC_checkGC(L);
+    api_checknelems(L, n);
+    if (n >= 2) {
+!     if (luaV_concat(L, n, L->top - L->base - 1) < 0) {
+!       lua_pushstring(L, "attempt to yield across C function which does not support it through lua_concat");
+!       lua_error(L);
+!     }
+      L->top -= (n-1);
+    }
+    else if (n == 0) {  /* push empty string */
+***************
+*** 920,922 ****
+--- 998,1003 ----
+    return name;
+  }
+  
++ LUA_API void *lua_get_frame_state (lua_State *L) {
++   return &L->ci->u.c.framestate;
++ }
+diff -crN lua-5.0.2/src/ldo.c lua-5.0.2.experimental/src/ldo.c
+*** lua-5.0.2/src/ldo.c	Tue Oct  7 08:25:42 2003
+--- lua-5.0.2.experimental/src/ldo.c	Sun Dec  5 01:13:46 2004
+***************
+*** 251,256 ****
+--- 251,259 ----
+      L->base = L->ci->base = restorestack(L, funcr) + 1;
+      ci->top = L->top + LUA_MINSTACK;
+      ci->state = CI_C;  /* a C function */
++     ci->u.c.framestate.i = 0; 	/* framestate variable is initialized to 0/NULL */
++     ci->u.c.framestate.p = 0;
++     ci->u.c.savetop = 0;
+      if (L->hookmask & LUA_MASKCALL)
+        luaD_callhook(L, LUA_HOOKCALL, -1);
+      lua_unlock(L);
+***************
+*** 259,264 ****
+--- 262,273 ----
+  #endif
+      n = (*clvalue(L->base - 1)->c.f)(L);  /* do the actual call */
+      lua_lock(L);
++     if (n < 0) {	/* yielded? */
++       if (ci->u.c.savetop) {
++         L->base = L->ci->base;	/* restore stack ptrs */
++         L->top = ci->u.c.savetop;
++       }
++     }
+      return L->top - n;
+    }
+  }
+***************
+*** 311,321 ****
+--- 320,360 ----
+    firstResult = luaD_precall(L, func);
+    if (firstResult == NULL)  /* is a Lua function? */
+      firstResult = luaV_execute(L);  /* call it */
++   if (firstResult == NULL || firstResult > L->top) {  /* it yielded? */
++     lua_pushstring(L, "attempt to yield across C function which does not support it through lua_call");
++     lua_error(L);
++   }
+    luaD_poscall(L, nResults, firstResult);
+    L->nCcalls--;
+    luaC_checkGC(L);
+  }
+  
++ /*
++ ** Call a function (C or Lua), with the possibility to let the called function yield.
++ ** Invoke as luaD_call. The return value is the number of values returned if the function
++ ** completed, or -1 if the function yielded.
++ */ 
++ int luaD_call_yp (lua_State *L, StkId func, int nResults) {
++   StkId firstResult;
++   int ret;
++   lua_assert(!(L->ci->state & CI_CALLING));
++   if (++L->nCcalls >= LUA_MAXCCALLS) {
++     if (L->nCcalls == LUA_MAXCCALLS)
++       luaG_runerror(L, "C stack overflow");
++     else if (L->nCcalls >= (LUA_MAXCCALLS + (LUA_MAXCCALLS>>3)))
++       luaD_throw(L, LUA_ERRERR);  /* error while handing stack error */
++   }
++   firstResult = luaD_precall(L, func);
++   if (firstResult == NULL)  /* is a Lua function? */
++     firstResult = luaV_execute(L);  /* call it */
++   if (firstResult == NULL || firstResult > L->top)  /* yielded? */
++     return -1;
++   ret = L->top - firstResult;
++   luaD_poscall(L, nResults, firstResult);
++   L->nCcalls--;
++   luaC_checkGC(L);
++   return (nResults != LUA_MULTRET) ? nResults : ret;
++ }
+  
+  static void resume (lua_State *L, void *ud) {
+    StkId firstResult;
+***************
+*** 323,341 ****
+    CallInfo *ci = L->ci;
+    if (ci == L->base_ci) {  /* no activation record? */
+      lua_assert(nargs < L->top - L->base);
+!     luaD_precall(L, L->top - (nargs + 1));  /* start coroutine */
+    }
+    else {  /* inside a yield */
+      lua_assert(ci->state & CI_YIELD);
+      if (ci->state & CI_C) {  /* `common' yield? */
+!       /* finish interrupted execution of `OP_CALL' */
+!       int nresults;
+!       lua_assert((ci-1)->state & CI_SAVEDPC);
+!       lua_assert(GET_OPCODE(*((ci-1)->u.l.savedpc - 1)) == OP_CALL ||
+!                  GET_OPCODE(*((ci-1)->u.l.savedpc - 1)) == OP_TAILCALL);
+!       nresults = GETARG_C(*((ci-1)->u.l.savedpc - 1)) - 1;
+!       luaD_poscall(L, nresults, L->top - nargs);  /* complete it */
+!       if (nresults >= 0) L->top = L->ci->top;
+      }
+      else {  /* yielded inside a hook: just continue its execution */
+        ci->state &= ~CI_YIELD;
+--- 362,388 ----
+    CallInfo *ci = L->ci;
+    if (ci == L->base_ci) {  /* no activation record? */
+      lua_assert(nargs < L->top - L->base);
+!     if ((firstResult = luaD_precall(L, L->top - (nargs + 1)))) {  /* start coroutine */
+!       if (firstResult <= L->top)
+!         luaD_poscall(L, LUA_MULTRET, firstResult);	/* it returned immediately */
+!       return;
+!     }
+    }
+    else {  /* inside a yield */
+      lua_assert(ci->state & CI_YIELD);
+      if (ci->state & CI_C) {  /* `common' yield? */
+!       StkId res;
+!       int yielded;
+!       
+!       /* finish interrupted execution of opcode */
+!       res = luaV_return(L, L->ci - 1, L->top - nargs, &yielded);
+!       if (res) {	/* it returned */
+!         luaD_poscall(L, LUA_MULTRET, res);
+!         return;
+!       }
+!       if (yielded) {	/* it yielded */
+!         return;
+!       }
+      }
+      else {  /* yielded inside a hook: just continue its execution */
+        ci->state &= ~CI_YIELD;
+***************
+*** 367,373 ****
+    else if (!(L->ci->state & CI_YIELD))  /* not inside a yield? */
+      return resume_error(L, "cannot resume non-suspended coroutine");
+    old_allowhooks = L->allowhook;
+!   lua_assert(L->errfunc == 0 && L->nCcalls == 0);
+    status = luaD_rawrunprotected(L, resume, &nargs);
+    if (status != 0) {  /* error? */
+      L->ci = L->base_ci;  /* go back to initial level */
+--- 414,420 ----
+    else if (!(L->ci->state & CI_YIELD))  /* not inside a yield? */
+      return resume_error(L, "cannot resume non-suspended coroutine");
+    old_allowhooks = L->allowhook;
+!   lua_assert(L->errfunc == 0);
+    status = luaD_rawrunprotected(L, resume, &nargs);
+    if (status != 0) {  /* error? */
+      L->ci = L->base_ci;  /* go back to initial level */
+***************
+*** 387,394 ****
+    CallInfo *ci;
+    lua_lock(L);
+    ci = L->ci;
+-   if (L->nCcalls > 0)
+-     luaG_runerror(L, "attempt to yield across metamethod/C-call boundary");
+    if (ci->state & CI_C) {  /* usual yield */
+      if ((ci-1)->state & CI_C)
+        luaG_runerror(L, "cannot yield a C function");
+--- 434,439 ----
+diff -crN lua-5.0.2/src/ldo.h lua-5.0.2.experimental/src/ldo.h
+*** lua-5.0.2/src/ldo.h	Wed Dec  4 11:29:32 2002
+--- lua-5.0.2.experimental/src/ldo.h	Sun Dec  5 01:13:46 2004
+***************
+*** 46,51 ****
+--- 46,52 ----
+  void luaD_callhook (lua_State *L, int event, int line);
+  StkId luaD_precall (lua_State *L, StkId func);
+  void luaD_call (lua_State *L, StkId func, int nResults);
++ int luaD_call_yp (lua_State *L, StkId func, int nResults);
+  int luaD_pcall (lua_State *L, Pfunc func, void *u,
+                  ptrdiff_t oldtop, ptrdiff_t ef);
+  void luaD_poscall (lua_State *L, int wanted, StkId firstResult);
+diff -crN lua-5.0.2/src/lib/lauxlib.c lua-5.0.2.experimental/src/lib/lauxlib.c
+*** lua-5.0.2/src/lib/lauxlib.c	Mon Apr  7 09:35:00 2003
+--- lua-5.0.2.experimental/src/lib/lauxlib.c	Sun Dec  5 01:13:46 2004
+***************
+*** 217,223 ****
+    if (!luaL_getmetafield(L, obj, event))  /* no metafield? */
+      return 0;
+    lua_pushvalue(L, obj);
+!   lua_call(L, 1, 1);
+    return 1;
+  }
+  
+--- 217,224 ----
+    if (!luaL_getmetafield(L, obj, event))  /* no metafield? */
+      return 0;
+    lua_pushvalue(L, obj);
+!   if (lua_call_yp(L, 1, 1, 1) < 0)	/* tail call */
+!     return -1;
+    return 1;
+  }
+  
+***************
+*** 413,418 ****
+--- 414,425 ----
+    B->lvl = 0;
+  }
+  
++ 
++ LUALIB_API void luaL_buffcopy (luaL_Buffer *src, luaL_Buffer *dst) {
++   memcpy(dst, src, sizeof *src);
++   dst->p = dst->buffer + bufflen(src);
++ }
++ 
+  /* }====================================================== */
+  
+  
+diff -crN lua-5.0.2/src/lib/lbaselib.c lua-5.0.2.experimental/src/lib/lbaselib.c
+*** lua-5.0.2/src/lib/lbaselib.c	Wed Mar  3 18:45:13 2004
+--- lua-5.0.2.experimental/src/lib/lbaselib.c	Sun Dec  5 01:13:46 2004
+***************
+*** 28,41 ****
+  ** (a console window or a log file, for instance).
+  */
+  static int luaB_print (lua_State *L) {
+    int n = lua_gettop(L);  /* number of arguments */
+    int i;
+    lua_getglobal(L, "tostring");
+    for (i=1; i<=n; i++) {
+      const char *s;
+      lua_pushvalue(L, -1);  /* function to be called */
+      lua_pushvalue(L, i);   /* value to print */
+!     lua_call(L, 1, 1);
+      s = lua_tostring(L, -1);  /* get result */
+      if (s == NULL)
+        return luaL_error(L, "`tostring' must return a string to `print'");
+--- 28,51 ----
+  ** (a console window or a log file, for instance).
+  */
+  static int luaB_print (lua_State *L) {
++   int *fs = lua_get_frame_state(L);
+    int n = lua_gettop(L);  /* number of arguments */
+    int i;
++   if (*fs) {
++     i = *fs;
++     n -= 2;	/* two non-arguments are on the stack: the tostring global and the return value from tostring */
++     goto resume;
++   }
+    lua_getglobal(L, "tostring");
+    for (i=1; i<=n; i++) {
+      const char *s;
+      lua_pushvalue(L, -1);  /* function to be called */
+      lua_pushvalue(L, i);   /* value to print */
+!     if (lua_call_yp(L, 1, 1, 0) < 0) {
+!       *fs = i;
+!       return -1;
+!     }
+! resume:    
+      s = lua_tostring(L, -1);  /* get result */
+      if (s == NULL)
+        return luaL_error(L, "`tostring' must return a string to `print'");
+***************
+*** 274,284 ****
+  
+  static int luaB_dofile (lua_State *L) {
+    const char *fname = luaL_optstring(L, 1, NULL);
+-   int n = lua_gettop(L);
+    int status = luaL_loadfile(L, fname);
+    if (status != 0) lua_error(L);
+!   lua_call(L, 0, LUA_MULTRET);
+!   return lua_gettop(L) - n;
+  }
+  
+  
+--- 284,292 ----
+  
+  static int luaB_dofile (lua_State *L) {
+    const char *fname = luaL_optstring(L, 1, NULL);
+    int status = luaL_loadfile(L, fname);
+    if (status != 0) lua_error(L);
+!   return lua_call_yp(L, 0, LUA_MULTRET, 1);
+  }
+  
+  
+***************
+*** 327,334 ****
+  static int luaB_tostring (lua_State *L) {
+    char buff[128];
+    luaL_checkany(L, 1);
+!   if (luaL_callmeta(L, 1, "__tostring"))  /* is there a metafield? */
+!     return 1;  /* use its value */
+    switch (lua_type(L, 1)) {
+      case LUA_TNUMBER:
+        lua_pushstring(L, lua_tostring(L, 1));
+--- 335,344 ----
+  static int luaB_tostring (lua_State *L) {
+    char buff[128];
+    luaL_checkany(L, 1);
+!   int ret;
+!   ret = luaL_callmeta(L, 1, "__tostring"); /* is there a metafield? */
+!   if (ret)
+!     return ret;
+    switch (lua_type(L, 1)) {
+      case LUA_TNUMBER:
+        lua_pushstring(L, lua_tostring(L, 1));
+diff -crN lua-5.0.2/src/lib/lstrlib.c lua-5.0.2.experimental/src/lib/lstrlib.c
+*** lua-5.0.2/src/lib/lstrlib.c	Thu Apr  3 07:35:34 2003
+--- lua-5.0.2.experimental/src/lib/lstrlib.c	Sun Dec  5 01:13:46 2004
+***************
+*** 547,556 ****
+    return 1;
+  }
+  
+  
+! static void add_s (MatchState *ms, luaL_Buffer *b,
+                     const char *s, const char *e) {
+    lua_State *L = ms->L;
+    if (lua_isstring(L, 3)) {
+      const char *news = lua_tostring(L, 3);
+      size_t l = lua_strlen(L, 3);
+--- 547,558 ----
+    return 1;
+  }
+  
++ #define SUSPEND_STACK_SPACE(ms) (4 + 2*(ms)->level)
+  
+! static int add_s (MatchState *ms, luaL_Buffer *b,
+                     const char *s, const char *e) {
+    lua_State *L = ms->L;
++   int ret;
+    if (lua_isstring(L, 3)) {
+      const char *news = lua_tostring(L, 3);
+      size_t l = lua_strlen(L, 3);
+***************
+*** 572,612 ****
+    }
+    else {  /* is a function */
+      int n;
+      lua_pushvalue(L, 3);
+      n = push_captures(ms, s, e);
+!     lua_call(L, n, 1);
+      if (lua_isstring(L, -1))
+        luaL_addvalue(b);  /* add return to accumulated result */
+      else
+        lua_pop(L, 1);  /* function result is not a string: pop it */
+    }
+  }
+  
+  
+  static int str_gsub (lua_State *L) {
+    size_t srcl;
+    const char *src = luaL_checklstring(L, 1, &srcl);
+    const char *p = luaL_checkstring(L, 2);
+    int max_s = luaL_optint(L, 4, srcl+1);
+    int anchor = (*p == '^') ? (p++, 1) : 0;
+    int n = 0;
+    MatchState ms;
+    luaL_Buffer b;
+    luaL_argcheck(L,
+      lua_gettop(L) >= 3 && (lua_isstring(L, 3) || lua_isfunction(L, 3)),
+      3, "string or function expected");
+    luaL_buffinit(L, &b);
+    ms.L = L;
+    ms.src_init = src;
+    ms.src_end = src+srcl;
+    while (n < max_s) {
+-     const char *e;
+      ms.level = 0;
+      e = match(&ms, src, p);
+      if (e) {
+        n++;
+!       add_s(&ms, &b, src, e);
+      }
+      if (e && e>src) /* non empty match? */
+        src = e;  /* skip it */
+      else if (src < ms.src_end)
+--- 574,673 ----
+    }
+    else {  /* is a function */
+      int n;
++     int suspendstack;
++ 
++     /* be sure we have enough space in the stack to be able to yield */
++     lua_settop(L, (suspendstack = lua_gettop(L)) + SUSPEND_STACK_SPACE(ms));
+      lua_pushvalue(L, 3);
+      n = push_captures(ms, s, e);
+!     
+!     ret = lua_call_yp(L, n, 1, 0);
+!     if (ret < 0) {  /* yielded? */
+!       return suspendstack;
+!     }
+!     lua_replace(L, suspendstack + 1);
+!     lua_pop(L, lua_gettop(L) - suspendstack - 1);
+      if (lua_isstring(L, -1))
+        luaL_addvalue(b);  /* add return to accumulated result */
+      else
+        lua_pop(L, 1);  /* function result is not a string: pop it */
+    }
++   return 0;
+  }
+  
+  
+  static int str_gsub (lua_State *L) {
++   int *fs = lua_get_frame_state(L);
+    size_t srcl;
+    const char *src = luaL_checklstring(L, 1, &srcl);
++   const char *orig_src = src;
+    const char *p = luaL_checkstring(L, 2);
+    int max_s = luaL_optint(L, 4, srcl+1);
+    int anchor = (*p == '^') ? (p++, 1) : 0;
+    int n = 0;
+    MatchState ms;
+    luaL_Buffer b;
++   luaL_Buffer *rb;
++   const char *e;
++   int suspendstack;
++   
++   if (*fs) {	/* resuming interrupted function call */
++     int suspendstack = *fs;	/* find index of saved suspend data */
++     ms.L = L;
++     ms.src_init = src;
++     ms.src_end = src+srcl;
++     n = lua_tonumber(L, suspendstack++);
++     e = orig_src + (int) lua_tonumber(L, suspendstack++);
++     src = orig_src + (int) lua_tonumber(L, suspendstack++);
++     ms.level = (int) lua_tonumber(L, suspendstack++);
++     rb = lua_touserdata(L, suspendstack++);
++     for (n=0; n<ms.level; n++) {
++         ms.capture[n].init = orig_src + (int) lua_tonumber(L, suspendstack++);
++         ms.capture[n].len = lua_tonumber(L, suspendstack++);
++     }
++     luaL_buffcopy(rb, &b);
++     lua_replace(L, *fs + 1);
++     lua_pop(L, lua_gettop(L) - *fs - 1);
++     if (lua_isstring(L, -1))
++       luaL_addvalue(&b);  /* add return to accumulated result */
++     else
++       lua_pop(L, 1);  /* function result is not a string: pop it */
++     goto resume;
++   }
++ 
+    luaL_argcheck(L,
+      lua_gettop(L) >= 3 && (lua_isstring(L, 3) || lua_isfunction(L, 3)),
+      3, "string or function expected");
++ 
++   lua_settop(L, 5);	/* force 4 arguments for stack consistency */
++   lua_pushnumber(L, max_s);
++   lua_replace(L, 4);		/* save the actual value of max_s */
++ 
+    luaL_buffinit(L, &b);
+    ms.L = L;
+    ms.src_init = src;
+    ms.src_end = src+srcl;
+    while (n < max_s) {
+      ms.level = 0;
+      e = match(&ms, src, p);
+      if (e) {
+        n++;
+!       if ((suspendstack = add_s(&ms, &b, src, e))) {		/* suspend execution */
+!         *fs = suspendstack;
+!         lua_pushnumber(L, n); lua_replace(L, suspendstack++);
+!         lua_pushnumber(L, e - orig_src); lua_replace(L, suspendstack++);
+!         lua_pushnumber(L, src - orig_src); lua_replace(L, suspendstack++);
+!         lua_pushnumber(L, ms.level); lua_replace(L, suspendstack++);
+!         rb = lua_newuserdata(L, sizeof(luaL_Buffer)); lua_replace(L, suspendstack++);
+!         luaL_buffcopy(&b, rb);
+!         for (n=0; n<ms.level; n++) {
+!           lua_pushnumber(L, ms.capture[n].init - orig_src); lua_replace(L, suspendstack++);
+!           lua_pushnumber(L, ms.capture[n].len); lua_replace(L, suspendstack++);
+!         }
+!         return -1;
+!       }
+      }
++ resume:    
+      if (e && e>src) /* non empty match? */
+        src = e;  /* skip it */
+      else if (src < ms.src_end)
+diff -crN lua-5.0.2/src/lib/ltablib.c lua-5.0.2.experimental/src/lib/ltablib.c
+*** lua-5.0.2/src/lib/ltablib.c	Thu Apr  3 07:35:34 2003
+--- lua-5.0.2.experimental/src/lib/ltablib.c	Sun Dec  5 01:13:46 2004
+***************
+*** 19,32 ****
+  
+  
+  static int luaB_foreachi (lua_State *L) {
+    int i;
+    int n = aux_getn(L, 1);
+    luaL_checktype(L, 2, LUA_TFUNCTION);
+    for (i=1; i<=n; i++) {
+      lua_pushvalue(L, 2);  /* function */
+      lua_pushnumber(L, (lua_Number)i);  /* 1st argument */
+      lua_rawgeti(L, 1, i);  /* 2nd argument */
+!     lua_call(L, 2, 1);
+      if (!lua_isnil(L, -1))
+        return 1;
+      lua_pop(L, 1);  /* remove nil result */
+--- 19,41 ----
+  
+  
+  static int luaB_foreachi (lua_State *L) {
++   int *fs = lua_get_frame_state(L);
+    int i;
+    int n = aux_getn(L, 1);
+    luaL_checktype(L, 2, LUA_TFUNCTION);
++   if (*fs) {
++     i = *fs;
++     goto resume;
++   }
+    for (i=1; i<=n; i++) {
+      lua_pushvalue(L, 2);  /* function */
+      lua_pushnumber(L, (lua_Number)i);  /* 1st argument */
+      lua_rawgeti(L, 1, i);  /* 2nd argument */
+!     if (lua_call_yp(L, 2, 1, 0) < 0) {
+!       *fs = i;
+!       return -1;
+!     }
+! resume:    
+      if (!lua_isnil(L, -1))
+        return 1;
+      lua_pop(L, 1);  /* remove nil result */
+***************
+*** 36,43 ****
+--- 45,55 ----
+  
+  
+  static int luaB_foreach (lua_State *L) {
++   int *fs = lua_get_frame_state(L);
+    luaL_checktype(L, 1, LUA_TTABLE);
+    luaL_checktype(L, 2, LUA_TFUNCTION);
++   if (*fs)
++      goto resume;
+    lua_pushnil(L);  /* first key */
+    for (;;) {
+      if (lua_next(L, 1) == 0)
+***************
+*** 45,51 ****
+      lua_pushvalue(L, 2);  /* function */
+      lua_pushvalue(L, -3);  /* key */
+      lua_pushvalue(L, -3);  /* value */
+!     lua_call(L, 2, 1);
+      if (!lua_isnil(L, -1))
+        return 1;
+      lua_pop(L, 2);  /* remove value and result */
+--- 57,67 ----
+      lua_pushvalue(L, 2);  /* function */
+      lua_pushvalue(L, -3);  /* key */
+      lua_pushvalue(L, -3);  /* value */
+!     if (lua_call_yp(L, 2, 1, 0) < 0) {
+!       *fs = 1;
+!       return -1;
+!     }
+! resume:    
+      if (!lua_isnil(L, -1))
+        return 1;
+      lua_pop(L, 2);  /* remove value and result */
+diff -crN lua-5.0.2/src/lstate.h lua-5.0.2.experimental/src/lstate.h
+*** lua-5.0.2/src/lstate.h	Thu Feb 27 05:52:30 2003
+--- lua-5.0.2.experimental/src/lstate.h	Sun Dec  5 01:13:46 2004
+***************
+*** 83,89 ****
+        int tailcalls;  /* number of tail calls lost under this entry */
+      } l;
+      struct {  /* for C functions */
+!       int dummy;  /* just to avoid an empty struct */
+      } c;
+    } u;
+  } CallInfo;
+--- 83,94 ----
+        int tailcalls;  /* number of tail calls lost under this entry */
+      } l;
+      struct {  /* for C functions */
+!       union {
+!          int i;
+!          void *p;
+!       } framestate;  /* C functions can use to track their state if they invoke a Lua function which yields */
+!       int nresults;  /* remember how many results the C function wanted when calling into a Lua function */
+!       StkId savetop; /* saved value of L->top used while letting C functions suspend */
+      } c;
+    } u;
+  } CallInfo;
+***************
+*** 100,105 ****
+--- 105,111 ----
+  #define CI_CALLING	(1<<2)
+  #define CI_SAVEDPC	(1<<3)  /* 1 if `savedpc' is updated */
+  #define CI_YIELD	(1<<4)  /* 1 if thread is suspended */
++ #define CI_CTAILCALL	(1<<5)  /* 1 if C function who called into Lua was doing a tail call */
+  
+  
+  #define ci_func(ci)	(clvalue((ci)->base - 1))
+diff -crN lua-5.0.2/src/lvm.c lua-5.0.2.experimental/src/lvm.c
+*** lua-5.0.2/src/lvm.c	Wed Mar  3 18:50:13 2004
+--- lua-5.0.2.experimental/src/lvm.c	Sun Dec  5 01:13:46 2004
+***************
+*** 95,114 ****
+  }
+  
+  
+! static void callTMres (lua_State *L, const TObject *f,
+                         const TObject *p1, const TObject *p2) {
+    setobj2s(L->top, f);  /* push function */
+    setobj2s(L->top+1, p1);  /* 1st argument */
+    setobj2s(L->top+2, p2);  /* 2nd argument */
+    luaD_checkstack(L, 3);  /* cannot check before (could invalidate p1, p2) */
+    L->top += 3;
+!   luaD_call(L, L->top - 3, 1);
+    L->top--;  /* result will be in L->top */
+  }
+  
+  
+  
+! static void callTM (lua_State *L, const TObject *f,
+                      const TObject *p1, const TObject *p2, const TObject *p3) {
+    setobj2s(L->top, f);  /* push function */
+    setobj2s(L->top+1, p1);  /* 1st argument */
+--- 95,119 ----
+  }
+  
+  
+! static int callTMres (lua_State *L, const TObject *f,
+                         const TObject *p1, const TObject *p2) {
++   int ret;                       
+    setobj2s(L->top, f);  /* push function */
+    setobj2s(L->top+1, p1);  /* 1st argument */
+    setobj2s(L->top+2, p2);  /* 2nd argument */
+    luaD_checkstack(L, 3);  /* cannot check before (could invalidate p1, p2) */
+    L->top += 3;
+!   ret = luaD_call_yp(L, L->top - 3, 1);
+!   if (ret < 0) {	/* mm yielded */
+!      return -1;
+!   }
+    L->top--;  /* result will be in L->top */
++   return 0;
+  }
+  
+  
+  
+! static int callTM (lua_State *L, const TObject *f,
+                      const TObject *p1, const TObject *p2, const TObject *p3) {
+    setobj2s(L->top, f);  /* push function */
+    setobj2s(L->top+1, p1);  /* 1st argument */
+***************
+*** 116,122 ****
+    setobj2s(L->top+3, p3);  /* 3th argument */
+    luaD_checkstack(L, 4);  /* cannot check before (could invalidate p1...p3) */
+    L->top += 4;
+!   luaD_call(L, L->top - 4, 0);
+  }
+  
+  
+--- 121,127 ----
+    setobj2s(L->top+3, p3);  /* 3th argument */
+    luaD_checkstack(L, 4);  /* cannot check before (could invalidate p1...p3) */
+    L->top += 4;
+!   return luaD_call_yp(L, L->top - 4, 0);
+  }
+  
+  
+***************
+*** 125,131 ****
+    const TObject *tm = fasttm(L, hvalue(t)->metatable, TM_INDEX);
+    if (tm == NULL) return &luaO_nilobject;  /* no TM */
+    if (ttisfunction(tm)) {
+!     callTMres(L, tm, t, key);
+      return L->top;
+    }
+    else return luaV_gettable(L, tm, key, loop);
+--- 130,138 ----
+    const TObject *tm = fasttm(L, hvalue(t)->metatable, TM_INDEX);
+    if (tm == NULL) return &luaO_nilobject;  /* no TM */
+    if (ttisfunction(tm)) {
+!     if (callTMres(L, tm, t, key) < 0) {		/* index metamethod yielded */
+!       return 0;
+!     }
+      return L->top;
+    }
+    else return luaV_gettable(L, tm, key, loop);
+***************
+*** 137,143 ****
+    if (ttisnil(tm))
+      luaG_typeerror(L, t, "index");
+    if (ttisfunction(tm)) {
+!     callTMres(L, tm, t, key);
+      return L->top;
+    }
+    else return luaV_gettable(L, tm, key, loop);
+--- 144,152 ----
+    if (ttisnil(tm))
+      luaG_typeerror(L, t, "index");
+    if (ttisfunction(tm)) {
+!     if (callTMres(L, tm, t, key) < 0) {		/* index metamethod yielded */
+!       return 0;
+!     }
+      return L->top;
+    }
+    else return luaV_gettable(L, tm, key, loop);
+***************
+*** 166,172 ****
+  /*
+  ** Receives table at `t', key at `key' and value at `val'.
+  */
+! void luaV_settable (lua_State *L, const TObject *t, TObject *key, StkId val) {
+    const TObject *tm;
+    int loop = 0;
+    do {
+--- 175,181 ----
+  /*
+  ** Receives table at `t', key at `key' and value at `val'.
+  */
+! int luaV_settable (lua_State *L, const TObject *t, TObject *key, StkId val) {
+    const TObject *tm;
+    int loop = 0;
+    do {
+***************
+*** 176,194 ****
+        if (!ttisnil(oldval) ||  /* result is no nil? */
+            (tm = fasttm(L, h->metatable, TM_NEWINDEX)) == NULL) { /* or no TM? */
+          setobj2t(oldval, val);  /* write barrier */
+!         return;
+        }
+        /* else will try the tag method */
+      }
+      else if (ttisnil(tm = luaT_gettmbyobj(L, t, TM_NEWINDEX)))
+        luaG_typeerror(L, t, "index");
+      if (ttisfunction(tm)) {
+!       callTM(L, tm, t, key, val);
+!       return;
+      }
+      t = tm;  /* else repeat with `tm' */ 
+    } while (++loop <= MAXTAGLOOP);
+    luaG_runerror(L, "loop in settable");
+  }
+  
+  
+--- 185,203 ----
+        if (!ttisnil(oldval) ||  /* result is no nil? */
+            (tm = fasttm(L, h->metatable, TM_NEWINDEX)) == NULL) { /* or no TM? */
+          setobj2t(oldval, val);  /* write barrier */
+!         return 0;
+        }
+        /* else will try the tag method */
+      }
+      else if (ttisnil(tm = luaT_gettmbyobj(L, t, TM_NEWINDEX)))
+        luaG_typeerror(L, t, "index");
+      if (ttisfunction(tm)) {
+!       return callTM(L, tm, t, key, val);
+      }
+      t = tm;  /* else repeat with `tm' */ 
+    } while (++loop <= MAXTAGLOOP);
+    luaG_runerror(L, "loop in settable");
++   return 0;
+  }
+  
+  
+***************
+*** 199,205 ****
+    if (ttisnil(tm))
+      tm = luaT_gettmbyobj(L, p2, event);  /* try second operand */
+    if (!ttisfunction(tm)) return 0;
+!   callTMres(L, tm, p1, p2);
+    res = restorestack(L, result);  /* previous call may change stack */
+    setobjs2s(res, L->top);
+    return 1;
+--- 208,216 ----
+    if (ttisnil(tm))
+      tm = luaT_gettmbyobj(L, p2, event);  /* try second operand */
+    if (!ttisfunction(tm)) return 0;
+!   if (callTMres(L, tm, p1, p2) < 0) {	/* mm yielded */
+!      return -1;
+!   }
+    res = restorestack(L, result);  /* previous call may change stack */
+    setobjs2s(res, L->top);
+    return 1;
+***************
+*** 228,234 ****
+    tm2 = luaT_gettmbyobj(L, p2, event);
+    if (!luaO_rawequalObj(tm1, tm2))  /* different metamethods? */
+      return -1;
+!   callTMres(L, tm1, p1, p2);
+    return !l_isfalse(L->top);
+  }
+  
+--- 239,246 ----
+    tm2 = luaT_gettmbyobj(L, p2, event);
+    if (!luaO_rawequalObj(tm1, tm2))  /* different metamethods? */
+      return -1;
+!   if (callTMres(L, tm1, p1, p2) < 0) 	/* mm yielded */
+!     return -2;
+    return !l_isfalse(L->top);
+  }
+  
+***************
+*** 263,269 ****
+      return nvalue(l) < nvalue(r);
+    else if (ttisstring(l))
+      return luaV_strcmp(tsvalue(l), tsvalue(r)) < 0;
+!   else if ((res = call_orderTM(L, l, r, TM_LT)) != -1)
+      return res;
+    return luaG_ordererror(L, l, r);
+  }
+--- 275,281 ----
+      return nvalue(l) < nvalue(r);
+    else if (ttisstring(l))
+      return luaV_strcmp(tsvalue(l), tsvalue(r)) < 0;
+!   else if ((res = call_orderTM(L, l, r, TM_LT)) != -1) 
+      return res;
+    return luaG_ordererror(L, l, r);
+  }
+***************
+*** 307,323 ****
+      default: return gcvalue(t1) == gcvalue(t2);
+    }
+    if (tm == NULL) return 0;  /* no TM? */
+!   callTMres(L, tm, t1, t2);  /* call TM */
+    return !l_isfalse(L->top);
+  }
+  
+  
+! void luaV_concat (lua_State *L, int total, int last) {
+    do {
+      StkId top = L->base + last + 1;
+      int n = 2;  /* number of elements handled in this pass (at least 2) */
+      if (!tostring(L, top-2) || !tostring(L, top-1)) {
+!       if (!call_binTM(L, top-2, top-1, top-2, TM_CONCAT))
+          luaG_concaterror(L, top-2, top-1);
+      } else if (tsvalue(top-1)->tsv.len > 0) {  /* if len=0, do nothing */
+        /* at least two string values; get as many as possible */
+--- 319,339 ----
+      default: return gcvalue(t1) == gcvalue(t2);
+    }
+    if (tm == NULL) return 0;  /* no TM? */
+!   if (callTMres(L, tm, t1, t2) < 0)  /* call TM */
+!     return -1;			/* yield */
+    return !l_isfalse(L->top);
+  }
+  
+  
+! int luaV_concat (lua_State *L, int total, int last) {
+    do {
+      StkId top = L->base + last + 1;
+      int n = 2;  /* number of elements handled in this pass (at least 2) */
+      if (!tostring(L, top-2) || !tostring(L, top-1)) {
+!       int res = call_binTM(L, top-2, top-1, top-2, TM_CONCAT);
+!       if (res < 0)	/* mm yielded */
+!         return -1;
+!       else if (!res)
+          luaG_concaterror(L, top-2, top-1);
+      } else if (tsvalue(top-1)->tsv.len > 0) {  /* if len=0, do nothing */
+        /* at least two string values; get as many as possible */
+***************
+*** 342,351 ****
+      total -= n-1;  /* got `n' strings to create 1 new */
+      last -= n-1;
+    } while (total > 1);  /* repeat until only 1 result left */
+  }
+  
+  
+! static void Arith (lua_State *L, StkId ra,
+                     const TObject *rb, const TObject *rc, TMS op) {
+    TObject tempb, tempc;
+    const TObject *b, *c;
+--- 358,368 ----
+      total -= n-1;  /* got `n' strings to create 1 new */
+      last -= n-1;
+    } while (total > 1);  /* repeat until only 1 result left */
++   return 0;
+  }
+  
+  
+! static int Arith (lua_State *L, StkId ra,
+                     const TObject *rb, const TObject *rc, TMS op) {
+    TObject tempb, tempc;
+    const TObject *b, *c;
+***************
+*** 361,367 ****
+          ptrdiff_t res = savestack(L, ra);
+          if (!ttisfunction(f))
+            luaG_runerror(L, "`__pow' (`^' operator) is not a function");
+!         callTMres(L, f, b, c);
+          ra = restorestack(L, res);  /* previous call may change stack */
+          setobjs2s(ra, L->top);
+          break;
+--- 378,385 ----
+          ptrdiff_t res = savestack(L, ra);
+          if (!ttisfunction(f))
+            luaG_runerror(L, "`__pow' (`^' operator) is not a function");
+!         if (callTMres(L, f, b, c) < 0)		/* mm yielded */
+!           return -1;
+          ra = restorestack(L, res);  /* previous call may change stack */
+          setobjs2s(ra, L->top);
+          break;
+***************
+*** 369,376 ****
+        default: lua_assert(0); break;
+      }
+    }
+!   else if (!call_binTM(L, rb, rc, ra, op))
+      luaG_aritherror(L, rb, rc);
+  }
+  
+  
+--- 387,399 ----
+        default: lua_assert(0); break;
+      }
+    }
+!   else {
+!     int mmstat = call_binTM(L, rb, rc, ra, op);
+!     if (mmstat < 0)		/* mm yielded */
+!       return -1;
+      luaG_aritherror(L, rb, rc);
++   }
++   return 0;
+  }
+  
+  
+***************
+*** 394,399 ****
+--- 417,599 ----
+  #define dojump(pc, i)	((pc) += (i))
+  
+  
++ /* This function handles returning to an opcode (or C function) that has been partially executed.
++  * It is used in the implementation of OP_RETURN and lua_resume. */
++ 
++ StkId luaV_return (lua_State *L, CallInfo *ci, StkId firstResult, int *yielded)
++ {
++   int nresults;
++   *yielded = 0;		/* return flag to indicate whether the C function yielded when we resumed it */
++   
++   while ((ci->state & CI_C) && (ci->state & CI_CALLING)) {
++     int n;
++ 
++     /* We're returning into a C function. Complete the function call. */
++     
++     nresults = L->top - firstResult;	/* number of actual return values for LUA_MULTRET */
++     luaD_poscall(L, ci->u.c.nresults, firstResult);
++     ci->state &= ~CI_CALLING;		/* API checks want this flag off */
++     
++     if (ci->state & CI_CTAILCALL) {
++       /* C function tail called. */
++ 
++       ci->state &= ~CI_CTAILCALL;
++       L->nCcalls--;
++       if (ci->u.c.nresults >= 0)
++         firstResult = L->top - ci->u.c.nresults;
++       else
++         firstResult = L->top - nresults;
++       ci = L->ci - 1;
++       continue;
++     }
++     
++     lua_unlock(L);
++     n = (*clvalue(L->base - 1)->c.f)(L);  /* do the actual call */
++     lua_lock(L);
++     if (n >= 0) {		/* function returned */
++       L->nCcalls--;
++       firstResult = L->top - n;
++       ci = L->ci - 1;
++     } else {			/* function yielded */
++       if (ci->u.c.savetop) {
++         L->base = L->ci->base;	/* restore stack ptrs */
++         L->top = ci->u.c.savetop;
++       }
++       *yielded = 1;
++       return NULL;
++     }
++   }
++   
++   /* See if our C frame is supposed to do the luaD_poscall(), or someone else up the chain. */
++ 
++   if (!(ci->state & CI_CALLING)) {
++     return firstResult;
++   }
++ 
++   lua_assert(ci->state & CI_SAVEDPC);
++   switch (GET_OPCODE(*(ci->u.l.savedpc - 1)))
++   {
++     /* Normal function calls */
++     
++     case OP_CALL:
++     case OP_TAILCALL:
++       /* finish execution of call */
++       nresults = GETARG_C(*(ci->u.l.savedpc - 1)) - 1;
++       luaD_poscall(L, nresults, firstResult);  /* complete it */
++       if (nresults >= 0) L->top = L->ci->top;
++       break;
++     
++     /* Metamethod invoked via callTMres() yielded */
++         
++     case OP_GETTABLE:
++     case OP_GETGLOBAL:
++     case OP_SELF:
++     case OP_ADD:
++     case OP_SUB:
++     case OP_MUL:
++     case OP_DIV:
++     case OP_POW:
++     case OP_CONCAT:
++     case OP_UNM:
++       /* finish execution of metamethod call */
++       luaD_poscall(L, 1, firstResult);  /* complete it */
++       L->top = L->ci->top;
++         
++       /* finish execution of get instruction */
++       setobj2s(XRA(*(ci->u.l.savedpc - 1)), L->top);
++       break;
++       
++     case OP_LT:
++     case OP_LE:
++     case OP_EQ:
++       /* finish execution of metamethod call */
++       luaD_poscall(L, 1, firstResult);  /* complete it */
++       L->top = L->ci->top;
++         
++       /* finish execution of branch */
++       if (!l_isfalse(L->top) != GETARG_A(*(ci->u.l.savedpc - 1)))
++         ci->u.l.savedpc++;
++       else
++         dojump(ci->u.l.savedpc, GETARG_sBx(*(ci->u.l.savedpc)) + 1);
++       break;
++       
++     /* Metamethod invoked via callTM() yielded */
++       
++     case OP_SETTABLE:
++     case OP_SETGLOBAL:
++       /* finish execution of metamethod call */
++       luaD_poscall(L, 0, firstResult);  /* complete it */
++       L->top = L->ci->top;
++       break;
++       
++     /* Other resumable opcodes */
++     
++     case OP_TFORLOOP:
++     {
++       Instruction i = *(ci->u.l.savedpc - 1);
++       int nvar = GETARG_C(i) + 1;
++       StkId ra;
++       StkId cb = ra + nvar + 2;
++       
++       /* finish execution of iterator call */
++       luaD_poscall(L, 3, firstResult);  /* complete it */
++       L->top = L->ci->top;
++       
++       ra = XRA(i) + 2;  /* final position of first result */
++       cb = ra + nvar;
++       do {  /* move results to proper positions */
++         nvar--;
++         setobjs2s(ra+nvar, cb+nvar);
++       } while (nvar > 0);
++       if (ttisnil(ra))  /* break loop? */
++         ci->u.l.savedpc++;  /* skip jump (break loop) */
++       else
++         dojump(ci->u.l.savedpc, GETARG_sBx(*(ci->u.l.savedpc)) + 1);  /* jump back */
++       break;
++     }
++         
++     default:
++       printf("returning to unexpected opcode\n");
++       abort();
++   }
++   return NULL;
++ }
++ 
++ /* These macros handle calling a function which may invoke a metamethod that yields. If a yield occurs,
++  * the PC is saved, and luaV_execute() returns. Note that if you change a new opcode to use one of
++  * these macros, then the opcode must be patched into luaV_return() above to complete the setobj2s
++  * (or whatever operation needs to occur after the metamethod returns) when the coroutine resumes.
++  */
++ 
++ /* This macro takes an argument which is a pointer to a TObject (if call completed) or NULL if call yielded. */
++ 
++ #define SETOBJ2S_YP(src, val) do { \
++ 	const TObject *ri; \
++ 	int ci_off = L->ci - L->base_ci; /* save our ci pointer, because we don't know how much it will change if the metamethod yields */ \
++ 	ri = (val); \
++ 	if (ri) { \
++ 	  setobj2s((src), ri); \
++ 	} else { \
++ 	  CallInfo *ci = L->base_ci + ci_off; \
++           ci->u.l.savedpc = pc;  /* save `pc' to return later */ \
++           ci->state = (CI_SAVEDPC | CI_CALLING); \
++           return NULL; \
++         } \
++ } while (0)      
++ 
++ /* This macro takes an argument which is the return value from luaD_call_yp (0 if completed, -1 if yield). */
++ 
++ #define YP(res) do { \
++ 	int ci_off = L->ci - L->base_ci; /* save our ci pointer, because we don't know how much it will change if the metamethod yields */ \
++ 	if (res < 0) { \
++ 	  CallInfo *ci = L->base_ci + ci_off; \
++           ci->u.l.savedpc = pc;  /* save `pc' to return later */ \
++           ci->state = (CI_SAVEDPC | CI_CALLING); \
++           return NULL; \
++         } \
++ } while (0)      
++ 	  
++ 
+  StkId luaV_execute (lua_State *L) {
+    LClosure *cl;
+    TObject *k;
+***************
+*** 466,472 ****
+          v = luaH_getstr(hvalue(&cl->g), tsvalue(rb));
+          if (!ttisnil(v)) { setobj2s(ra, v); }
+          else
+!           setobj2s(XRA(i), luaV_index(L, &cl->g, rb, 0));
+          break;
+        }
+        case OP_GETTABLE: {
+--- 666,672 ----
+          v = luaH_getstr(hvalue(&cl->g), tsvalue(rb));
+          if (!ttisnil(v)) { setobj2s(ra, v); }
+          else
+!           SETOBJ2S_YP(XRA(i), luaV_index(L, &cl->g, rb, 0));
+          break;
+        }
+        case OP_GETTABLE: {
+***************
+*** 475,490 ****
+          if (ttistable(rb)) {
+            const TObject *v = luaH_get(hvalue(rb), rc);
+            if (!ttisnil(v)) { setobj2s(ra, v); }
+!           else
+!             setobj2s(XRA(i), luaV_index(L, rb, rc, 0));
+          }
+-         else
+-           setobj2s(XRA(i), luaV_getnotable(L, rb, rc, 0));
+          break;
+        }
+        case OP_SETGLOBAL: {
+          lua_assert(ttisstring(KBx(i)) && ttistable(&cl->g));
+!         luaV_settable(L, &cl->g, KBx(i), ra);
+          break;
+        }
+        case OP_SETUPVAL: {
+--- 675,692 ----
+          if (ttistable(rb)) {
+            const TObject *v = luaH_get(hvalue(rb), rc);
+            if (!ttisnil(v)) { setobj2s(ra, v); }
+!           else {
+!             SETOBJ2S_YP(XRA(i), luaV_index(L, rb, rc, 0));
+!           }
+!         }
+!         else {
+!           SETOBJ2S_YP(XRA(i), luaV_getnotable(L, rb, rc, 0));
+          }
+          break;
+        }
+        case OP_SETGLOBAL: {
+          lua_assert(ttisstring(KBx(i)) && ttistable(&cl->g));
+!         YP(luaV_settable(L, &cl->g, KBx(i), ra));
+          break;
+        }
+        case OP_SETUPVAL: {
+***************
+*** 493,499 ****
+          break;
+        }
+        case OP_SETTABLE: {
+!         luaV_settable(L, ra, RKB(i), RKC(i));
+          break;
+        }
+        case OP_NEWTABLE: {
+--- 695,701 ----
+          break;
+        }
+        case OP_SETTABLE: {
+!         YP(luaV_settable(L, ra, RKB(i), RKC(i)));
+          break;
+        }
+        case OP_NEWTABLE: {
+***************
+*** 512,521 ****
+            const TObject *v = luaH_getstr(hvalue(rb), tsvalue(rc));
+            if (!ttisnil(v)) { setobj2s(ra, v); }
+            else
+!             setobj2s(XRA(i), luaV_index(L, rb, rc, 0));
+          }
+          else
+!           setobj2s(XRA(i), luaV_getnotable(L, rb, rc, 0));
+          break;
+        }
+        case OP_ADD: {
+--- 714,723 ----
+            const TObject *v = luaH_getstr(hvalue(rb), tsvalue(rc));
+            if (!ttisnil(v)) { setobj2s(ra, v); }
+            else
+!             SETOBJ2S_YP(XRA(i), luaV_index(L, rb, rc, 0));
+          }
+          else
+!           SETOBJ2S_YP(XRA(i), luaV_getnotable(L, rb, rc, 0));
+          break;
+        }
+        case OP_ADD: {
+***************
+*** 525,531 ****
+            setnvalue(ra, nvalue(rb) + nvalue(rc));
+          }
+          else
+!           Arith(L, ra, rb, rc, TM_ADD);
+          break;
+        }
+        case OP_SUB: {
+--- 727,733 ----
+            setnvalue(ra, nvalue(rb) + nvalue(rc));
+          }
+          else
+!           YP(Arith(L, ra, rb, rc, TM_ADD));
+          break;
+        }
+        case OP_SUB: {
+***************
+*** 535,541 ****
+            setnvalue(ra, nvalue(rb) - nvalue(rc));
+          }
+          else
+!           Arith(L, ra, rb, rc, TM_SUB);
+          break;
+        }
+        case OP_MUL: {
+--- 737,743 ----
+            setnvalue(ra, nvalue(rb) - nvalue(rc));
+          }
+          else
+!           YP(Arith(L, ra, rb, rc, TM_SUB));
+          break;
+        }
+        case OP_MUL: {
+***************
+*** 545,551 ****
+            setnvalue(ra, nvalue(rb) * nvalue(rc));
+          }
+          else
+!           Arith(L, ra, rb, rc, TM_MUL);
+          break;
+        }
+        case OP_DIV: {
+--- 747,753 ----
+            setnvalue(ra, nvalue(rb) * nvalue(rc));
+          }
+          else
+!           YP(Arith(L, ra, rb, rc, TM_MUL));
+          break;
+        }
+        case OP_DIV: {
+***************
+*** 555,565 ****
+            setnvalue(ra, nvalue(rb) / nvalue(rc));
+          }
+          else
+!           Arith(L, ra, rb, rc, TM_DIV);
+          break;
+        }
+        case OP_POW: {
+!         Arith(L, ra, RKB(i), RKC(i), TM_POW);
+          break;
+        }
+        case OP_UNM: {
+--- 757,767 ----
+            setnvalue(ra, nvalue(rb) / nvalue(rc));
+          }
+          else
+!           YP(Arith(L, ra, rb, rc, TM_DIV));
+          break;
+        }
+        case OP_POW: {
+!         YP(Arith(L, ra, RKB(i), RKC(i), TM_POW));
+          break;
+        }
+        case OP_UNM: {
+***************
+*** 569,576 ****
+            setnvalue(ra, -nvalue(rb));
+          }
+          else {
+            setnilvalue(&temp);
+!           if (!call_binTM(L, RB(i), &temp, ra, TM_UNM))
+              luaG_aritherror(L, RB(i), &temp);
+          }
+          break;
+--- 771,787 ----
+            setnvalue(ra, -nvalue(rb));
+          }
+          else {
++           int ci_off = L->ci - L->base_ci;
++           int rv;
+            setnilvalue(&temp);
+!           rv = call_binTM(L, RB(i), &temp, ra, TM_UNM);
+!           if (rv < 0) {
+!             CallInfo *ci = L->base_ci + ci_off;
+!             ci->u.l.savedpc = pc;  /* save `pc' to return later */
+!             ci->state = (CI_SAVEDPC | CI_CALLING);
+!             return NULL;
+!           }
+!           if (!rv)
+              luaG_aritherror(L, RB(i), &temp);
+          }
+          break;
+***************
+*** 583,589 ****
+        case OP_CONCAT: {
+          int b = GETARG_B(i);
+          int c = GETARG_C(i);
+!         luaV_concat(L, c-b+1, c);  /* may change `base' (and `ra') */
+          base = L->base;
+          setobjs2s(RA(i), base+b);
+          luaC_checkGC(L);
+--- 794,800 ----
+        case OP_CONCAT: {
+          int b = GETARG_B(i);
+          int c = GETARG_C(i);
+!         YP(luaV_concat(L, c-b+1, c));  /* may change `base' (and `ra') */
+          base = L->base;
+          setobjs2s(RA(i), base+b);
+          luaC_checkGC(L);
+***************
+*** 594,610 ****
+          break;
+        }
+        case OP_EQ: {
+!         if (equalobj(L, RKB(i), RKC(i)) != GETARG_A(i)) pc++;
+          else dojump(pc, GETARG_sBx(*pc) + 1);
+          break;
+        }
+        case OP_LT: {
+!         if (luaV_lessthan(L, RKB(i), RKC(i)) != GETARG_A(i)) pc++;
+          else dojump(pc, GETARG_sBx(*pc) + 1);
+          break;
+        }
+        case OP_LE: {
+!         if (luaV_lessequal(L, RKB(i), RKC(i)) != GETARG_A(i)) pc++;
+          else dojump(pc, GETARG_sBx(*pc) + 1);
+          break;
+        }
+--- 805,848 ----
+          break;
+        }
+        case OP_EQ: {
+!         int ci_off = L->ci - L->base_ci;
+!         int rv = 0; /* default to false, if type tags are not equal */
+!         if (ttype(RKB(i)) == ttype(RKC(i))) {
+!           rv = luaV_equalval(L, RKB(i), RKC(i));
+!           if (rv < 0) {
+!             CallInfo *ci = L->base_ci + ci_off;
+!             ci->u.l.savedpc = pc;  /* save `pc' to return later */
+!             ci->state = (CI_SAVEDPC | CI_CALLING);
+!             return NULL;
+!           }
+!         }
+!         if (rv != GETARG_A(i)) pc++;
+          else dojump(pc, GETARG_sBx(*pc) + 1);
+          break;
+        }
+        case OP_LT: {
+!         int ci_off = L->ci - L->base_ci;
+!         int rv = luaV_lessthan(L, RKB(i), RKC(i));
+!         if (rv < 0) {
+!           CallInfo *ci = L->base_ci + ci_off;
+!           ci->u.l.savedpc = pc;  /* save `pc' to return later */
+!           ci->state = (CI_SAVEDPC | CI_CALLING);
+!           return NULL;
+!         }
+!         if (rv != GETARG_A(i)) pc++;
+          else dojump(pc, GETARG_sBx(*pc) + 1);
+          break;
+        }
+        case OP_LE: {
+!         int ci_off = L->ci - L->base_ci;
+!         int rv = luaV_lessequal(L, RKB(i), RKC(i));
+!         if (rv < 0) {
+!           CallInfo *ci = L->base_ci + ci_off;
+!           ci->u.l.savedpc = pc;  /* save `pc' to return later */
+!           ci->state = (CI_SAVEDPC | CI_CALLING);
+!           return NULL;
+!         }
+!         if (rv != GETARG_A(i)) pc++;
+          else dojump(pc, GETARG_sBx(*pc) + 1);
+          break;
+        }
+***************
+*** 619,624 ****
+--- 857,863 ----
+        }
+        case OP_CALL:
+        case OP_TAILCALL: {
++         int ci_off = L->ci - L->base_ci; /* memorize current CallInfo, as luaD_precall can add arbitrary stack frames */
+          StkId firstResult;
+          int b = GETARG_B(i);
+          int nresults;
+***************
+*** 627,635 ****
+          firstResult = luaD_precall(L, ra);
+          if (firstResult) {
+            if (firstResult > L->top) {  /* yield? */
+              lua_assert(L->ci->state == (CI_C | CI_YIELD));
+!             (L->ci - 1)->u.l.savedpc = pc;
+!             (L->ci - 1)->state = CI_SAVEDPC;
+              return NULL;
+            }
+            /* it was a C function (`precall' called it); adjust results */
+--- 866,875 ----
+          firstResult = luaD_precall(L, ra);
+          if (firstResult) {
+            if (firstResult > L->top) {  /* yield? */
++             CallInfo *ci = L->base_ci + ci_off;
+              lua_assert(L->ci->state == (CI_C | CI_YIELD));
+!             ci->u.l.savedpc = pc;
+!             ci->state = (CI_SAVEDPC | CI_CALLING);	/* set CI_CALLING as we may have to return through this frame */
+              return NULL;
+            }
+            /* it was a C function (`precall' called it); adjust results */
+***************
+*** 637,658 ****
+            if (nresults >= 0) L->top = L->ci->top;
+          }
+          else {  /* it is a Lua function */
+            if (GET_OPCODE(i) == OP_CALL) {  /* regular call? */
+!             (L->ci-1)->u.l.savedpc = pc;  /* save `pc' to return later */
+!             (L->ci-1)->state = (CI_SAVEDPC | CI_CALLING);
+            }
+            else {  /* tail call: put new frame in place of previous one */
+              int aux;
+!             base = (L->ci - 1)->base;  /* `luaD_precall' may change the stack */
+              ra = RA(i);
+              if (L->openupval) luaF_close(L, base);
+              for (aux = 0; ra+aux < L->top; aux++)  /* move frame down */
+                setobjs2s(base+aux-1, ra+aux);
+!             (L->ci - 1)->top = L->top = base+aux;  /* correct top */
+              lua_assert(L->ci->state & CI_SAVEDPC);
+!             (L->ci - 1)->u.l.savedpc = L->ci->u.l.savedpc;
+!             (L->ci - 1)->u.l.tailcalls++;  /* one more call lost */
+!             (L->ci - 1)->state = CI_SAVEDPC;
+              L->ci--;  /* remove new frame */
+              L->base = L->ci->base;
+            }
+--- 877,899 ----
+            if (nresults >= 0) L->top = L->ci->top;
+          }
+          else {  /* it is a Lua function */
++           CallInfo *ci = L->base_ci + ci_off;
+            if (GET_OPCODE(i) == OP_CALL) {  /* regular call? */
+!             ci->u.l.savedpc = pc;  /* save `pc' to return later */
+!             ci->state = (CI_SAVEDPC | CI_CALLING);
+            }
+            else {  /* tail call: put new frame in place of previous one */
+              int aux;
+!             base = ci->base;  /* `luaD_precall' may change the stack */
+              ra = RA(i);
+              if (L->openupval) luaF_close(L, base);
+              for (aux = 0; ra+aux < L->top; aux++)  /* move frame down */
+                setobjs2s(base+aux-1, ra+aux);
+!             ci->top = L->top = base+aux;  /* correct top */
+              lua_assert(L->ci->state & CI_SAVEDPC);
+!             ci->u.l.savedpc = L->ci->u.l.savedpc;
+!             ci->u.l.tailcalls++;  /* one more call lost */
+!             ci->state = CI_SAVEDPC;
+              L->ci--;  /* remove new frame */
+              L->base = L->ci->base;
+            }
+***************
+*** 674,685 ****
+            return ra;  /* no: return */
+          }
+          else {  /* yes: continue its execution */
+!           int nresults;
+!           lua_assert(ttisfunction(ci->base - 1) && (ci->state & CI_SAVEDPC));
+!           lua_assert(GET_OPCODE(*(ci->u.l.savedpc - 1)) == OP_CALL);
+!           nresults = GETARG_C(*(ci->u.l.savedpc - 1)) - 1;
+!           luaD_poscall(L, nresults, ra);
+!           if (nresults >= 0) L->top = L->ci->top;
+            goto retentry;
+          }
+        }
+--- 915,930 ----
+            return ra;  /* no: return */
+          }
+          else {  /* yes: continue its execution */
+!           int yielded;
+!           StkId res;
+!           
+!           lua_assert(ttisfunction(ci->base - 1));
+!           res = luaV_return(L, ci, ra, &yielded);
+!           if (res)
+!             return res;
+!           if (yielded)
+!             return NULL;
+! 
+            goto retentry;
+          }
+        }
+***************
+*** 709,715 ****
+          setobjs2s(cb+1, ra+1);
+          setobjs2s(cb+2, ra+2);
+          L->top = cb+3;  /* func. + 2 args (state and index) */
+!         luaD_call(L, cb, nvar);
+          L->top = L->ci->top;
+          ra = XRA(i) + 2;  /* final position of first result */
+          cb = ra + nvar;
+--- 954,960 ----
+          setobjs2s(cb+1, ra+1);
+          setobjs2s(cb+2, ra+2);
+          L->top = cb+3;  /* func. + 2 args (state and index) */
+!         YP(luaD_call_yp(L, cb, nvar));
+          L->top = L->ci->top;
+          ra = XRA(i) + 2;  /* final position of first result */
+          cb = ra + nvar;
+***************
+*** 777,781 ****
+      }
+    }
+  }
+- 
+- 
+--- 1022,1024 ----
+diff -crN lua-5.0.2/src/lvm.h lua-5.0.2.experimental/src/lvm.h
+*** lua-5.0.2/src/lvm.h	Thu Nov 14 10:16:21 2002
+--- lua-5.0.2.experimental/src/lvm.h	Sun Dec  5 01:13:46 2004
+***************
+*** 19,35 ****
+                           (((o) = luaV_tonumber(o,n)) != NULL))
+  
+  #define equalobj(L,o1,o2) \
+! 	(ttype(o1) == ttype(o2) && luaV_equalval(L, o1, o2))
+  
+  
+  int luaV_lessthan (lua_State *L, const TObject *l, const TObject *r);
+  int luaV_equalval (lua_State *L, const TObject *t1, const TObject *t2);
+- const TObject *luaV_tonumber (const TObject *obj, TObject *n);
+- int luaV_tostring (lua_State *L, StkId obj);
+  const TObject *luaV_gettable (lua_State *L, const TObject *t, TObject *key,
+                                int loop);
+! void luaV_settable (lua_State *L, const TObject *t, TObject *key, StkId val);
+! StkId luaV_execute (lua_State *L);
+! void luaV_concat (lua_State *L, int total, int last);
+  
+  #endif
+--- 19,41 ----
+                           (((o) = luaV_tonumber(o,n)) != NULL))
+  
+  #define equalobj(L,o1,o2) \
+! 	(ttype(o1) == ttype(o2) ? luaV_equalval(L, o1, o2) : 0)
+  
++ StkId luaV_return (lua_State *L, CallInfo *ci, StkId firstResult, int *yielded);
++ int luaV_settable (lua_State *L, const TObject *t, TObject *key, StkId val);
++ int luaV_tostring (lua_State *L, StkId obj);
++ StkId luaV_execute (lua_State *L);
++ const TObject *luaV_tonumber (const TObject *obj, TObject *n);
++ 
++ /* The following functions are yield-possible. If a yield occurs in a metamethod,
++  * they return -1 (int return value) or NULL (pointer return value).
++  */
+  
+  int luaV_lessthan (lua_State *L, const TObject *l, const TObject *r);
+  int luaV_equalval (lua_State *L, const TObject *t1, const TObject *t2);
+  const TObject *luaV_gettable (lua_State *L, const TObject *t, TObject *key,
+                                int loop);
+! int luaV_concat (lua_State *L, int total, int last);
+! 
+  
+  #endif
+diff -crN lua-5.0.2/src/testdofile.lua lua-5.0.2.experimental/src/testdofile.lua
+*** lua-5.0.2/src/testdofile.lua	Wed Dec 31 18:00:00 1969
+--- lua-5.0.2.experimental/src/testdofile.lua	Sun Dec  5 01:13:46 2004
+***************
+*** 0 ****
+--- 1,2 ----
++ 
++ return coroutine.yield() .. coroutine.yield(), "xoxoxo", 21
+diff -crN lua-5.0.2/src/testmeta.lua lua-5.0.2.experimental/src/testmeta.lua
+*** lua-5.0.2/src/testmeta.lua	Wed Dec 31 18:00:00 1969
+--- lua-5.0.2.experimental/src/testmeta.lua	Sun Dec  5 01:13:46 2004
+***************
+*** 0 ****
+--- 1,759 ----
++ 
++ 
++ function test_plain_coro()
++ 
++     local a = {}
++ 
++     function a.func(a, b)
++         local val, v2 = coroutine.yield()
++         return val .. v2
++     end
++ 
++     local function c()
++         local r = ""
++         for i=1, 3 do
++             local q = a.func()
++             r = r .. q
++         end
++         return r
++     end
++ 
++     local r = coroutine.create(c)
++     coroutine.resume(r)
++     coroutine.resume(r, "abc", "ABC")
++     coroutine.resume(r, "xyz", "XYZ")
++     local succ, val = coroutine.resume(r, "012345", "6789")
++     
++     assert(succ and val == "abcABCxyzXYZ0123456789")
++     print("==== plain coroutine passed")
++ 
++ end
++ 
++ 
++ function test_OP_GETTABLE()
++ 
++     local a = {}
++     local b = {}
++ 
++     function b.__index(a, b)
++         local val, v2 = coroutine.yield()
++         return val .. v2
++     end
++ 
++     setmetatable(a, b)
++ 
++     local function c()
++         local r = ""
++         for i=1, 3 do
++             r = r .. a.zoo
++         end
++         return r
++     end
++ 
++     local r = coroutine.create(c)
++     coroutine.resume(r)
++     coroutine.resume(r, "abc", "ABC")
++     coroutine.resume(r, "xyz", "XYZ")
++     local succ, val = coroutine.resume(r, "012345", "6789")
++     
++     assert(succ and val == "abcABCxyzXYZ0123456789")
++     print("==== OP_GETTABLE passed")
++ 
++ end
++ 
++ 
++ function test_OP_GETTABLE_tail()
++ 
++     local a = {}
++     local b = {}
++ 
++     function b.__index(a, b)
++         return coroutine.yield()
++     end
++ 
++     setmetatable(a, b)
++ 
++     local function c()
++         local r = ""
++         for i=1, 3 do
++             r = r .. a.zoo
++         end
++         return r
++     end
++ 
++     local r = coroutine.create(c)
++     coroutine.resume(r)
++     coroutine.resume(r, "abc")
++     coroutine.resume(r, "xyz")
++     local succ, val = coroutine.resume(r, "123")
++     
++     assert(succ and val == "abcxyz123")
++     print("==== OP_GETTABLE (tail-call) passed")
++ 
++ end
++ 
++ 
++ function test_OP_GETGLOBAL()
++ 
++     local a = {}
++     local b = {}
++ 
++     function b.__index(a, b)
++         local val, v2 = coroutine.yield()
++         return val .. v2
++     end
++ 
++     setmetatable(a, b)
++ 
++     local function c()
++         local r = ""
++         for i=1, 3 do
++             r = r .. zoo
++         end
++         return r
++     end
++     
++     setfenv(c, a)
++ 
++     local r = coroutine.create(c)
++     coroutine.resume(r)
++     coroutine.resume(r, "abc", "ABC")
++     coroutine.resume(r, "xyz", "XYZ")
++     local succ, val = coroutine.resume(r, "012345", "6789")
++     
++     assert(succ and val == "abcABCxyzXYZ0123456789")
++     print("==== OP_GETGLOBAL passed")
++ 
++ end
++ 
++ 
++ function test_OP_SELF()
++ 
++     local a = {}
++     local b = {}
++ 
++     function b.__index(a, b)
++         local val, v2 = coroutine.yield()
++         return function()
++            return val .. v2
++ 	end
++     end
++ 
++     setmetatable(a, b)
++ 
++     local function c()
++         local r = ""
++         for i=1, 3 do
++             local q = a:zoo()
++             r = r .. q
++         end
++         return r
++     end
++ 
++     local r = coroutine.create(c)
++     coroutine.resume(r)
++     coroutine.resume(r, "abc", "ABC")
++     coroutine.resume(r, "xyz", "XYZ")
++     local succ, val = coroutine.resume(r, "012345", "6789")
++     
++     assert(succ and val == "abcABCxyzXYZ0123456789")
++     print("==== OP_SELF passed")
++ 
++ end
++ 
++ 
++ function test_OP_SETTABLE()
++ 
++     local a = { groucho="" }
++     local b = {}
++ 
++     function b.__newindex(self, k, v)
++         local val, v2 = coroutine.yield()
++         a.groucho = a.groucho .. val .. v2
++     end
++ 
++     setmetatable(a, b)
++ 
++     local function c()
++         local r = ""
++         for i=1, 3 do
++             a.zoo = "x"
++         end
++         return a.groucho
++     end
++ 
++     local r = coroutine.create(c)
++     coroutine.resume(r)
++     coroutine.resume(r, "abc", "ABC")
++     coroutine.resume(r, "xyz", "XYZ")
++     local succ, val = coroutine.resume(r, "012345", "6789")
++     
++     assert(succ and val == "abcABCxyzXYZ0123456789")
++     print("==== OP_SETTABLE passed")
++ 
++ end
++ 
++ 
++ function test_OP_SETGLOBAL()
++ 
++     local a = { groucho="" }
++     local b = {}
++ 
++     function b.__newindex(self, k, v)
++         local val, v2 = coroutine.yield()
++         a.groucho = a.groucho .. val .. v2
++     end
++ 
++     setmetatable(a, b)
++ 
++     local function c()
++         local r = ""
++         for i=1, 3 do
++             zoo = "x"
++         end
++         return groucho
++     end
++     
++     setfenv(c, a)
++ 
++     local r = coroutine.create(c)
++     coroutine.resume(r)
++     coroutine.resume(r, "abc", "ABC")
++     coroutine.resume(r, "xyz", "XYZ")
++     local succ, val = coroutine.resume(r, "012345", "6789")
++     
++     assert(succ and val == "abcABCxyzXYZ0123456789")
++     print("==== OP_SETGLOBAL passed")
++ 
++ end
++ 
++ 
++ function test_OP_ADD()
++ 
++     local a = { value=10 }
++     local a2 = { value=15 }
++     local b = {}
++     
++     function b.__add(self, other)
++        return self.value + other.value + coroutine.yield()
++     end
++     
++     setmetatable(a, b)
++     setmetatable(a2, b)
++     
++     local function c()
++        return a + a2
++     end
++     
++     local r = coroutine.create(c)
++     coroutine.resume(r)
++     local succ, val = coroutine.resume(r, 11)
++     
++     assert(succ and val == (10 + 15 + 11))
++     print("==== OP_ADD passed")
++ 
++ end    
++     
++ 
++ function test_OP_SUB()
++ 
++     local a = { value=10 }
++     local a2 = { value=15 }
++     local b = {}
++     
++     function b.__sub(self, other)
++        return self.value + other.value + coroutine.yield()
++     end
++     
++     setmetatable(a, b)
++     setmetatable(a2, b)
++     
++     local function c()
++        return a - a2
++     end
++     
++     local r = coroutine.create(c)
++     coroutine.resume(r)
++     local succ, val = coroutine.resume(r, 11)
++     
++     assert(succ and val == (10 + 15 + 11))
++     print("==== OP_SUB passed")
++ 
++ end    
++ 
++ 
++ function test_OP_MUL()
++ 
++     local a = { value=10 }
++     local a2 = { value=15 }
++     local b = {}
++     
++     function b.__mul(self, other)
++        return self.value + other.value + coroutine.yield()
++     end
++     
++     setmetatable(a, b)
++     setmetatable(a2, b)
++     
++     local function c()
++        return a * a2
++     end
++     
++     local r = coroutine.create(c)
++     coroutine.resume(r)
++     local succ, val = coroutine.resume(r, 11)
++     
++     assert(succ and val == (10 + 15 + 11))
++     print("==== OP_MUL passed")
++ 
++ end    
++ 
++ 
++ function test_OP_DIV()
++ 
++     local a = { value=10 }
++     local a2 = { value=15 }
++     local b = {}
++     
++     function b.__div(self, other)
++        return self.value + other.value + coroutine.yield()
++     end
++     
++     setmetatable(a, b)
++     setmetatable(a2, b)
++     
++     local function c()
++        return a / a2
++     end
++     
++     local r = coroutine.create(c)
++     coroutine.resume(r)
++     local succ, val = coroutine.resume(r, 11)
++     
++     assert(succ and val == (10 + 15 + 11))
++     print("==== OP_DIV passed")
++ 
++ end    
++ 
++ 
++ function test_OP_POW()
++ 
++     local a = { value=10 }
++     local a2 = { value=15 }
++     local b = {}
++     
++     function b.__pow(self, other)
++        return self.value + other.value + coroutine.yield()
++     end
++     
++     setmetatable(a, b)
++     setmetatable(a2, b)
++     
++     local function c()
++        return a ^ a2
++     end
++     
++     local r = coroutine.create(c)
++     coroutine.resume(r)
++     local succ, val = coroutine.resume(r, 11)
++     
++     assert(succ and val == (10 + 15 + 11))
++     print("==== OP_POW passed")
++ 
++ end    
++ 
++ 
++ function test_OP_POW_global()
++ 
++     local function c()
++        return 2 ^ 5
++     end
++     
++     function __pow(x, y)
++        return coroutine.yield()
++     end
++     
++     local r = coroutine.create(c)
++     coroutine.resume(r)
++     local succ, val = coroutine.resume(r, 100)
++     
++     assert(succ and val == 100)
++     print("==== OP_POW_global passed")
++     
++ end    
++ 
++ 
++ function test_OP_LT()
++ 
++     local a = { value=10 }
++     local a2 = { value=15 }
++     local b = {}
++     
++     function b.__lt(self, other)
++        return coroutine.yield()
++     end
++     
++     setmetatable(a, b)
++     setmetatable(a2, b)
++     
++     local function c()
++        local r = ""
++        for i=1, 3 do
++           if a < a2 then
++              r = r .. "yes"
++           else
++              r = r .. "no"
++           end
++        end
++        return r
++     end
++     
++     local r = coroutine.create(c)
++     coroutine.resume(r)
++     local succ, val = coroutine.resume(r, true)
++     local succ, val = coroutine.resume(r, false)
++     local succ, val = coroutine.resume(r, true)
++     
++     assert(succ and val == "yesnoyes")
++     print("==== OP_LT passed")
++ 
++ end    
++ 
++ 
++ function test_OP_LE()
++ 
++     local a = { value=10 }
++     local a2 = { value=15 }
++     local b = {}
++     
++     function b.__le(self, other)
++        return coroutine.yield()
++     end
++     
++     setmetatable(a, b)
++     setmetatable(a2, b)
++     
++     local function c()
++        local r = ""
++        for i=1, 3 do
++           if a <= a2 then
++              r = r .. "yes"
++           else
++              r = r .. "no"
++           end
++        end
++        return r
++     end
++     
++     local r = coroutine.create(c)
++     coroutine.resume(r)
++     local succ, val = coroutine.resume(r, true)
++     local succ, val = coroutine.resume(r, false)
++     local succ, val = coroutine.resume(r, true)
++     
++     assert(succ and val == "yesnoyes")
++     print("==== OP_LE passed")
++ 
++ end    
++ 
++ 
++ function test_OP_EQ()
++ 
++     local a = { value=10 }
++     local a2 = { value=15 }
++     local b = {}
++     
++     function b.__eq(self, other)
++        return coroutine.yield()
++     end
++     
++     setmetatable(a, b)
++     setmetatable(a2, b)
++     
++     local function c()
++        local r = ""
++        for i=1, 3 do
++           if a == a2 then
++              r = r .. "yes"
++           else
++              r = r .. "no"
++           end
++        end
++        return r
++     end
++     
++     local r = coroutine.create(c)
++     coroutine.resume(r)
++     local succ, val = coroutine.resume(r, true)
++     local succ, val = coroutine.resume(r, false)
++     local succ, val = coroutine.resume(r, true)
++     
++     assert(succ and val == "yesnoyes")
++     print("==== OP_EQ passed")
++ 
++ end    
++ 
++ 
++ function test_OP_CONCAT()
++ 
++     local a = { value=10 }
++     local a2 = { value=15 }
++     local b = {}
++     
++     function b.__concat(self, other)
++        return self.value + other.value + coroutine.yield()
++     end
++     
++     setmetatable(a, b)
++     setmetatable(a2, b)
++     
++     local function c()
++        return a .. a2
++     end
++     
++     local r = coroutine.create(c)
++     coroutine.resume(r)
++     local succ, val = coroutine.resume(r, 11)
++     
++     assert(succ and val == (10 + 15 + 11))
++     print("==== OP_CONCAT passed")
++ 
++ end    
++ 
++ 
++ function test_OP_UNM()
++ 
++     local a = { value=10 }
++     local b = {}
++     
++     function b.__unm(self)
++        return coroutine.yield()
++     end
++     
++     setmetatable(a, b)
++     
++     local function c()
++        return -a
++     end
++     
++     local r = coroutine.create(c)
++     coroutine.resume(r)
++     local succ, val = coroutine.resume(r, 52)
++     
++     assert(succ and val == 52)
++     print("==== OP_UNM passed")
++ 
++ end    
++ 
++ 
++ function test_OP_TFORLOOP()
++ 
++     local function iter()
++         return coroutine.yield()
++     end
++     
++     local function c()
++         local r = ""
++         for a, b, c in iter do
++             r = r .. a .. b .. c
++         end
++         return r
++     end
++     
++     local r = coroutine.create(c)
++     coroutine.resume(r)
++     coroutine.resume(r, "abc", "DEF", "000")
++     coroutine.resume(r, "ghi", "JKLM", "111")
++     local succ, val = coroutine.resume(r)
++     
++     assert(succ and val == "abcDEF000ghiJKLM111")
++     print("==== OP_TFORLOOP passed")
++ 
++ end
++ 
++ 
++ function test_table_foreachi()
++ 
++     local t = {"abc", "XYZ", "12345"}
++     
++     local function c()
++         table.foreachi(t, function (k,v)
++             return coroutine.yield(v)
++         end)
++         coroutine.yield("ALL DONE!")
++     end
++     
++     local r = coroutine.create(c)
++     local succ, val
++     
++     succ, val = coroutine.resume(r)
++     assert(succ and val == "abc")
++ 
++     succ, val = coroutine.resume(r)
++     assert(succ and val == "XYZ")
++ 
++     succ, val = coroutine.resume(r, true)
++     assert(succ and val == "ALL DONE!")
++     
++     print("==== table.foreachi() passed")
++     
++ end
++ 
++ 
++ function test_table_foreach()
++ 
++     local t = {"abc", "XYZ", "12345"}
++     
++     local function c()
++         table.foreach(t, function (k,v)
++             return coroutine.yield(k, v)
++         end)
++         coroutine.yield(500, "ALL DONE!")
++     end
++     
++     local r = coroutine.create(c)
++     local succ, k, v
++     
++     succ, k, v = coroutine.resume(r)
++     assert(succ)
++     t[k] = "hit"
++ 
++     succ, k, v = coroutine.resume(r)
++     assert(succ)
++     t[k] = "hit"
++ 
++     succ, k, v = coroutine.resume(r)
++     assert(succ)
++     t[k] = "hit"
++ 
++     succ, k, v = coroutine.resume(r)
++     assert(succ)
++     t[k] = "hit"
++     
++     assert(t[1] == "hit")
++     assert(t[2] == "hit")
++     assert(t[3] == "hit")
++     assert(t[500] == "hit")
++ 
++     print("==== table.foreach() passed")
++     
++ end
++ 
++ 
++ function test_tostring()
++ 
++     local x = {}
++     local y = { __tostring = function() return coroutine.yield() end }
++     
++     setmetatable(x, y)
++     
++     local function c()
++         return tostring(x)
++     end
++     
++     local r = coroutine.create(c)
++     coroutine.resume(r)
++     local succ, val = coroutine.resume(r, "hello")
++     
++     assert(succ and val == "hello")
++     print("==== tostring() passed")
++     
++ end
++ 
++ 
++ function test_print()
++ 
++     local x = {}
++     local y = { __tostring = function() return coroutine.yield() end }
++     
++     setmetatable(x, y)
++     
++     local function c()
++         print(x, x, x)
++     end
++     
++     local r = coroutine.create(c)
++     coroutine.resume(r)
++     assert(coroutine.resume(r, "hello"))
++     assert(coroutine.resume(r, "out"))
++     assert(coroutine.resume(r, "there"))
++     
++     print("==== print() passed")
++     
++ end
++ 
++ 
++ function test_dofile()
++ 
++     local function c()
++        return dofile("testdofile.lua")
++     end
++     
++     local r = coroutine.create(c)
++     coroutine.resume(r)
++     coroutine.resume(r, "abc")
++     local succ, val = coroutine.resume(r, "def")
++     
++     assert(succ and val == "abcdef")
++     print("==== dofile() passed")
++     
++ end    
++ 
++ 
++ function test_string_gsub()
++ 
++     local function c()
++         return string.gsub("xxx yyy zzz X Y Z", "(%w+)", function (s) return coroutine.yield(s) end)
++     end
++     
++     local r = coroutine.create(c)
++     local succ, val = coroutine.resume(r)
++     assert(succ and val == "xxx")
++     
++     succ, val = coroutine.resume(r, "a")
++     assert(succ and val == "yyy")
++     
++     succ, val = coroutine.resume(r, "lua")
++     assert(succ and val == "zzz")
++ 
++     succ, val = coroutine.resume(r, "zoo")
++     assert(succ and val == "X")
++     
++     succ, val = coroutine.resume(r, "in")
++     assert(succ and val == "Y")
++ 
++     succ, val = coroutine.resume(r, "a")
++     assert(succ and val == "Z")
++     
++     succ, val = coroutine.resume(r, "shoe")
++     assert(succ and val == "a lua zoo in a shoe")
++     
++     print("==== gsub() passed")
++ end
++     
++ 
++ test_plain_coro()
++ test_OP_GETTABLE()
++ test_OP_GETTABLE_tail()
++ test_OP_GETGLOBAL()
++ test_OP_SELF()
++ test_OP_SETTABLE()
++ test_OP_SETGLOBAL()
++ test_OP_ADD()
++ test_OP_SUB()
++ test_OP_MUL()
++ test_OP_DIV()
++ test_OP_POW()
++ test_OP_POW_global()
++ test_OP_LT()
++ test_OP_LE()
++ test_OP_EQ()
++ test_OP_CONCAT()
++ test_OP_UNM()
++ test_OP_TFORLOOP()
++ test_table_foreachi()
++ test_table_foreach()
++ test_tostring()
++ test_print()
++ test_dofile()
++ test_string_gsub()
