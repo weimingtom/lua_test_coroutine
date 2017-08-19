@@ -2,7 +2,7 @@ function step_f1()
 	coroutine.yield("Lua implements a small set of advanced features such as first-class functions, ");
 end
 
-function step()
+function step_ff()
 	--step_f1()
     coroutine.yield("Lua implements a small set of advanced features such as first-class functions, ");
     coroutine.yield("garbage collection, closures, proper tail calls, coercion (automatic conversion between ");
@@ -34,7 +34,7 @@ function trace(event, line)
 	local s = debug.getinfo(2).source
 	local linedefined = debug.getinfo(2).linedefined
 	local name = debug.getinfo(2).name
-	if false then
+	if true then
 		if line ~= nil then 
 			print('[DEBUG]' .. s .. ':' ..line) 
 		else
@@ -42,24 +42,25 @@ function trace(event, line)
 		end
 	end
 	--print("---")
-	io.stdout:flush()
+	--io.stdout:flush()
 	--os.execute('ping -n 2 127.0.0.1 > nul')
 
 	local deltaTime = os.clock() - startTime
-	if deltaTime >= 0.1 then
+	--if deltaTime >= 0.1 then
+	if true then
 		print("deltaTime = ", deltaTime)
 		
-		coroutine.yield("check exit");
-		startTime = os.clock()
+		--coroutine.yield("check exit");
+		--startTime = os.clock()
 	end
 end
 
-function step_failed()
-	io.stdout:setvbuf('no')
+function step()
+	--io.stdout:setvbuf('no')
 	startTime = os.clock()
 
 	--c/r/l
-	debug.sethook(trace, 'r') 
+	debug.sethook(trace, 'l') 
 	print('fib(24) == ', fib(24))	
 end
 

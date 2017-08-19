@@ -128,6 +128,7 @@ SOURCE=.\lua\lgc.c
 # Begin Source File
 
 SOURCE=.\lua\linit.c
+# PROP Exclude_From_Build 1
 # End Source File
 # Begin Source File
 
@@ -160,6 +161,7 @@ SOURCE=.\lua\lopcodes.c
 # Begin Source File
 
 SOURCE=.\lua\loslib.c
+# PROP Exclude_From_Build 1
 # End Source File
 # Begin Source File
 
@@ -214,6 +216,7 @@ SOURCE=.\lua\lzio.c
 # Begin Source File
 
 SOURCE=.\lua\print.c
+# PROP Exclude_From_Build 1
 # End Source File
 # Begin Source File
 
@@ -223,6 +226,7 @@ SOURCE=.\StdAfx.cpp
 # Begin Source File
 
 SOURCE=.\lua\wmain.c
+# PROP Exclude_From_Build 1
 # End Source File
 # End Group
 # Begin Group "Header Files"

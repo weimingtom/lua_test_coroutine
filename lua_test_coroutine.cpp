@@ -57,7 +57,7 @@ void printStack(lua_State *L) {
 
 
 void test_stack_print() {
-    lua_State *L = luaL_newstate();
+    lua_State *L = lua_open();
 
     lua_pushboolean(L, 1);
     lua_pushnumber(L, 100.0);
@@ -69,12 +69,17 @@ void test_stack_print() {
 }
 
 void test_coroutine() {
-    lua_State *L = luaL_newstate();
+    lua_State *L = lua_open();
 
     //luaopen_base(L);
-	luaL_openlibs(L);
+ lua_baselibopen(L);
+ lua_tablibopen(L);
+ lua_iolibopen(L);
+ lua_strlibopen(L);
+ lua_mathlibopen(L);
+ lua_dblibopen(L);
 
-    if (luaL_dofile(L, "coroutine.lua")) {
+    if (lua_dofile(L, "coroutine.lua")) {
         printf(">>error: %s\n", lua_tostring(L, lua_gettop(L)));
 		fflush(stdout);
         lua_close(L);
@@ -91,7 +96,7 @@ void test_coroutine() {
         lua_close(L);
         return;
 	}
-    while (lua_resume(co, 0)) {
+    while (lua_resume(co, 0)==0) {
         printStack(co);
         //_getch();
 		//getch();
