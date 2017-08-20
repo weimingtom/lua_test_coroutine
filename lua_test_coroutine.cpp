@@ -96,7 +96,11 @@ void test_coroutine() {
         lua_close(L);
         return;
 	}
-    while (lua_resume(co, 0)==0) {
+    while (1) {
+		if (lua_resume(co, 0)!=0){
+			printf(">>error: %s\n", lua_tostring(co, lua_gettop(co)));
+			break;
+		}
         printStack(co);
         //_getch();
 		//getch();
